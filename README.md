@@ -1,52 +1,66 @@
-﻿# 基金策略管家 (Fund Strategy Manager)
+﻿![demo](./docs/demo.png)
+# Fund Strategy Manager
 
-这是一个本地运行的基金策略辅助工具，核心逻辑是使用“最近一次成交价 ±5%”给出买入/卖出提醒。
+一个帮助你“严格执行低买高卖”的基金量化工具
 
-## 你现在可以直接双击启动
+---
 
-- 双击 [双击启动.bat](./双击启动.bat)（等价于 [Start.bat](./Start.bat)）
-- 程序会自动完成：
-  - 创建虚拟环境（首次）
-  - 安装依赖（首次或依赖变更时）
-  - 启动服务并自动打开浏览器
+## 🚀 下载
 
-默认访问地址：`http://127.0.0.1:5000`
+👉 点击下载最新版（Windows）：
 
-## 分享给别人（双击版）
+https://github.com/GoatY010/fund-strategy-manager/releases
 
-1. 在你的电脑上双击 [一键打包分享版.bat](./一键打包分享版.bat)（等价于 [BuildShareable.bat](./BuildShareable.bat)）
-2. 构建完成后，会生成：
-   - `release\FundStrategyManager\` 文件夹版
-   - `release\FundStrategyManager.zip` 压缩包
-3. 把 `zip` 发给别人即可，对方解压后双击：
-   - `DoubleClickStart.bat` 或 `FundStrategyManager.exe`
+---
 
-## 目录说明
+## ⚡ 快速开始
 
-- [app.py](./app.py): 后端服务与策略逻辑
-- [templates/index.html](./templates/index.html): 页面结构
-- [static/app.js](./static/app.js): 前端交互
-- [static/style.css](./static/style.css): 页面样式
-- [Start.bat](./Start.bat): 本机一键启动
-- [双击启动.bat](./双击启动.bat): 中文入口脚本
-- [BuildShareable.bat](./BuildShareable.bat): 一键打包分享版
-- [一键打包分享版.bat](./一键打包分享版.bat): 中文打包入口脚本
-- [Run_Portable.bat](./Run_Portable.bat): 分享版启动器模板
+1. 下载并解压 `FundStrategyManager_v1.0.zip`
+2. 双击 `FundStrategyManager.exe`
+3. 添加基金代码
+4. 输入持仓和最近成交价
+5. 根据提示进行买入 / 卖出
 
-## 常用环境变量（可选）
+---
 
-- `FUND_HOST`：默认 `127.0.0.1`
-- `FUND_PORT`：默认 `5000`
-- `FUND_DEBUG`：默认 `0`
-- `FUND_OPEN_BROWSER`：默认源码运行时 `0`，打包 exe 运行时 `1`
+## 🧠 核心策略
 
-## 数据文件
+以“最近一次成交价”为基准：
 
-- 数据库文件：`fund_strategy.db`
-- 位置：
-  - 源码运行时，在项目根目录
-  - exe 运行时，在 exe 所在目录
+* 📉 跌 5% → 买入
+* 📈 涨 5% → 卖出
+* 🔁 每次交易后自动更新基准价
 
-## 免责声明
+👉 自动循环执行低买高卖策略
 
-本工具仅用于策略执行辅助，不构成投资建议。
+---
+
+## 📊 功能
+
+* 基金实时监控
+* 自动买卖信号提示
+* 持仓管理
+* 收益统计
+
+---
+
+## 🔄 使用流程
+
+添加基金 → 设置持仓 → 系统监控 → 触发信号 → 执行交易 → 更新价格 → 循环
+
+---
+
+## ⚠ 注意
+
+如果 Windows 提示：
+
+“Windows 已保护你的电脑”
+
+👉 点击：
+“更多信息” → “仍要运行”
+
+---
+
+## 📌 免责声明
+
+本软件仅供学习与辅助决策，不构成投资建议。
