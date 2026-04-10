@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>基金策略管家</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <main class="page-shell">
+        <header class="hero panel">
+            <div>
+                <p class="tag">Fund Strategy Manager</p>
+                <h1>基金策略管家</h1>
+                <p class="hero-note">围绕“上次交易价 ±5%”自动监控，触发买卖提醒，辅助执行纪律化策略。</p>
+            </div>
+            <div class="hero-actions">
+                <button id="refreshBtn" class="btn">刷新行情</button>
+                <p id="lastUpdated" class="muted">上次刷新: --</p>
+            </div>
+        </header>
+
+        <section class="panel">
+            <h2>添加基金</h2>
+            <form id="addFundForm" class="form-grid">
+                <label>
+                    基金代码
+                    <input type="text" name="code" required maxlength="6" pattern="\d{6}" placeholder="例如 161725">
+                </label>
+                <label>
+                    状态
+                    <select name="mode">
+                        <option value="watch">仅观察</option>
+                        <option value="holding">实际持有</option>
+                    </select>
+                </label>
+                <label>
+                    持仓份额
+                    <input type="number" name="holding_shares" value="0" min="0" step="0.01" required>
+                </label>
+                <label>
+                    最近成交价
+                    <input type="number" name="last_trade_price" min="0" step="0.0001" placeholder="可留空自动取当前估值">
+                </label>
+                <button type="submit" class="btn btn-strong">添加</button>
+            </form>
+            <p class="muted">提示: 若填写持仓份额，系统会自动记录一笔“初始化买入”交易。</p>
+        </section>
+
+        <section class="panel">
+            <h2>资产总览</h2>
+            <div class="summary-grid">
+                <article class="summary-card">
+                    <p>跟踪基金数</p>
+                    <strong id="summaryCount">0</strong>
+                </article>
+                <article class="summary-card">
+                    <p>触发预警数</p>
+                    <strong id="summaryAlerts">0</strong>
+                </article>
+                <article class="summary-card">
+                    <p>总市值</p>
+                    <strong id="summaryMarketValue">¥0.00</strong>
+                </article>
+                <article class="summary-card">
+                    <p>累计盈亏</p>
+                    <strong id="summaryPnL">¥0.00</strong>
+                </article>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>基金监控列表</h2>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>代码</th>
+                            <th>名称</th>
+                            <th>状态</th>
+                            <th>上次成交</th>
+                            <th>当前估值</th>
+                            <th>今日涨跌</th>
+                            <th>买入线</th>
+                            <th>卖出线</th>
+                            <th>信号</th>
+                            <th>持仓份额</th>
+                            <th>市值</th>
+                            <th>累计盈亏</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fundTableBody">
+                        <tr>
+                            <td colspan="13" class="empty">暂无基金，请先添加。</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <dialog id="editDialog" class="dialog">
+        <form method="dialog" class="dialog-close-row">
+            <button class="btn btn-ghost" value="cancel">关闭</button>
+        </form>
+        <h3>更新持仓/基准</h3>
+        <form id="editFundForm" class="form-grid compact">
+            <input type="hidden" name="fund_id">
+            <label>
+                基金名称
+                <input type="text" name="name" required>
+            </label>
+            <label>
+                状态
+                <select name="mode">
+                    <option value="watch">仅观察</option>
+                    <option value="holding">实际持有</option>
+                </select>
+            </label>
+            <label>
+                持仓份额
+                <input type="number" name="holding_shares" min="0" step="0.01" required>
+            </label>
+            <label>
+                最近成交价
+                <input type="number" name="last_trade_price" min="0.0001" step="0.0001" required>
+            </label>
+            <button type="submit" class="btn btn-strong">保存</button>
+        </form>
+    </dialog>
+
+    <dialog id="tradeDialog" class="dialog dialog-wide">
+        <form method="dialog" class="dialog-close-row">
+            <button class="btn btn-ghost" value="cancel">关闭</button>
+        </form>
+        <h3 id="tradeDialogTitle">交易录入</h3>
+        <form id="tradeForm" class="form-grid compact">
+            <input type="hidden" name="fund_id">
+            <label>
+                交易日期
+                <input type="date" name="trade_date" required>
+            </label>
+            <label>
+                方向
+                <select name="side">
+                    <option value="buy">买入</option>
+                    <option value="sell">卖出</option>
+                </select>
+            </label>
+            <label>
+                成交份额
+                <input type="number" name="shares" min="0.01" step="0.01" required>
+            </label>
+            <label>
+                成交单价
+                <input type="number" name="price" min="0.0001" step="0.0001" required>
+            </label>
+            <label class="span-2">
+                备注
+                <input type="text" name="note" maxlength="80" placeholder="可选">
+            </label>
+            <button type="submit" class="btn btn-strong">提交交易</button>
+        </form>
+        <div class="trade-table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>日期</th>
+                        <th>方向</th>
+                        <th>份额</th>
+                        <th>单价</th>
+                        <th>金额</th>
+                        <th>备注</th>
+                    </tr>
+                </thead>
+                <tbody id="tradeTableBody">
+                    <tr>
+                        <td colspan="6" class="empty">暂无交易记录。</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </dialog>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
