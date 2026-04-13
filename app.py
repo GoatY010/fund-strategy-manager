@@ -56,6 +56,8 @@ def init_db() -> None:
                 mode TEXT NOT NULL CHECK(mode IN ('watch', 'holding')),
                 last_trade_price REAL NOT NULL,
                 holding_shares REAL NOT NULL DEFAULT 0,
+                group_name TEXT NOT NULL DEFAULT '默认分组',
+                alert_percent REAL NOT NULL DEFAULT 0.05,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -65,7 +67,8 @@ def init_db() -> None:
                 fund_id INTEGER NOT NULL,
                 trade_date TEXT NOT NULL,
                 side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
-                shares REAL NOT NULL,
+                amount REAL,
+                shares REAL,
                 price REAL NOT NULL,
                 note TEXT,
                 created_at TEXT NOT NULL,
@@ -76,6 +79,24 @@ def init_db() -> None:
                 ON trades(fund_id, trade_date DESC, id DESC);
             """
         )
+        
+        # 兼容老数据库：尝试添加新列如果尚不存在
+        try:
+            conn.execute("ALTER TABLE funds ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认分组';")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE funds ADD COLUMN alert_percent REAL NOT NULL DEFAULT 0.05;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN amount REAL;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN shares REAL;")
+        except sqlite3.OperationalError:
+            pass
 
 
 def now_iso() -> str:
@@ -157,11 +178,11 @@ def normalize_mode(mode: str | None) -> str:
     return "watch"
 
 
-def compute_signal(current_price: float | None, base_price: float | None) -> tuple[str, float | None, float | None]:
+def compute_signal(current_price: float | None, base_price: float | None, alert_percent: float = 0.05) -> tuple[str, float | None, float | None]:
     if current_price is None or base_price is None or base_price <= 0:
         return "no-data", None, None
-    buy_line = base_price * 0.95
-    sell_line = base_price * 1.05
+    buy_line = base_price * (1 - alert_percent)
+    sell_line = base_price * (1 + alert_percent)
     if current_price <= buy_line:
         return "buy", buy_line, sell_line
     if current_price >= sell_line:
@@ -209,6 +230,9 @@ def list_funds():
     for fund in funds:
         fund_id = int(fund["id"])
         code = fund["code"]
+        group_name = fund["group_name"]
+        alert_percent = float(fund["alert_percent"])
+        
         quote = fetch_quote(code, force_refresh=force_refresh)
 
         current_price = quote["current_price"] if quote else None
@@ -219,7 +243,7 @@ def list_funds():
 
         base_price = to_float(fund["last_trade_price"])
         shares = float(fund["holding_shares"] or 0)
-        signal, buy_line, sell_line = compute_signal(current_price, base_price)
+        signal, buy_line, sell_line = compute_signal(current_price, base_price, alert_percent)
 
         trade_info = trade_summaries.get(fund_id, {"buy_total": 0.0, "sell_total": 0.0})
         valuation_price = current_price if current_price is not None else base_price
@@ -237,6 +261,8 @@ def list_funds():
                 "id": fund_id,
                 "code": code,
                 "name": display_name,
+                "group_name": group_name,
+                "alert_percent": alert_percent,
                 "mode": fund["mode"],
                 "last_trade_price": base_price,
                 "holding_shares": shares,
@@ -278,6 +304,9 @@ def create_fund():
         return jsonify({"error": "基金代码必须是 6 位数字。"}), 400
 
     mode = normalize_mode(str(payload.get("mode", "watch")).strip())
+    group_name = str(payload.get("group_name", "默认分组")).strip()
+    alert_percent = to_float(payload.get("alert_percent"))
+    alert_percent = alert_percent if alert_percent is not None else 0.05
     shares = to_float(payload.get("holding_shares"))
     shares = 0.0 if shares is None else shares
     if shares < 0:
@@ -301,10 +330,10 @@ def create_fund():
         with get_db() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO funds(code, name, mode, last_trade_price, holding_shares, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO funds(code, name, mode, last_trade_price, holding_shares, group_name, alert_percent, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (code, name, mode, last_trade_price, shares, created_at, created_at),
+                (code, name, mode, last_trade_price, shares, group_name, alert_percent, created_at, created_at),
             )
             fund_id = int(cursor.lastrowid)
             if shares > 0:
@@ -338,6 +367,17 @@ def update_fund(fund_id: int):
         mode = normalize_mode(str(payload.get("mode", "")).strip())
         updates.append("mode = ?")
         params.append(mode)
+
+    if "group_name" in payload:
+        group_name = str(payload.get("group_name", "")).strip()
+        updates.append("group_name = ?")
+        params.append(group_name)
+
+    if "alert_percent" in payload:
+        alert_percent = to_float(payload.get("alert_percent"))
+        if alert_percent is not None:
+            updates.append("alert_percent = ?")
+            params.append(alert_percent)
 
     if "holding_shares" in payload:
         shares = to_float(payload.get("holding_shares"))
@@ -428,12 +468,29 @@ def create_trade(fund_id: int):
     if side not in {"buy", "sell"}:
         return jsonify({"error": "交易方向必须是 buy 或 sell。"}), 400
 
-    shares = to_float(payload.get("shares"))
     price = to_float(payload.get("price"))
-    if shares is None or shares <= 0:
-        return jsonify({"error": "成交份额必须大于 0。"}), 400
     if price is None or price <= 0:
         return jsonify({"error": "成交单价必须大于 0。"}), 400
+
+    shares = to_float(payload.get("shares"))
+    amount = to_float(payload.get("amount"))
+
+    # 按金额买入时自动计算份额
+    if side == "buy":
+        if amount is not None and amount > 0 and (shares is None or shares <= 0):
+            shares = amount / price
+        elif shares is not None and shares > 0 and (amount is None or amount <= 0):
+            amount = shares * price
+            
+    # 按份额卖出时计算金额
+    if side == "sell":
+        if shares is not None and shares > 0 and (amount is None or amount <= 0):
+            amount = shares * price
+        elif amount is not None and amount > 0 and (shares is None or shares <= 0):
+            shares = amount / price
+
+    if shares is None or shares <= 0:
+        return jsonify({"error": "份额或金额必须大于 0。"}), 400
 
     note = str(payload.get("note", "")).strip()
     created_at = now_iso()
@@ -453,10 +510,10 @@ def create_trade(fund_id: int):
 
         conn.execute(
             """
-            INSERT INTO trades(fund_id, trade_date, side, shares, price, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades(fund_id, trade_date, side, amount, shares, price, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (fund_id, trade_date, side, shares, price, note, created_at),
+            (fund_id, trade_date, side, amount, shares, price, note, created_at),
         )
         conn.execute(
             """
@@ -468,6 +525,79 @@ def create_trade(fund_id: int):
         )
 
     return jsonify({"ok": True, "message": "交易已录入并更新基准价。"})
+
+
+@app.delete("/api/funds/<int:fund_id>/trades/<int:trade_id>")
+def delete_trade(fund_id: int, trade_id: int):
+    with get_db() as conn:
+        trade = conn.execute("SELECT * FROM trades WHERE id = ? AND fund_id = ?", (trade_id, fund_id)).fetchone()
+        if not trade:
+            return jsonify({"error": "交易记录不存在。"}), 404
+
+        fund = conn.execute("SELECT holding_shares, last_trade_price FROM funds WHERE id = ?", (fund_id,)).fetchone()
+        if not fund:
+            return jsonify({"error": "基金不存在。"}), 404
+
+        side = trade["side"]
+        shares = float(trade["shares"])
+        current_shares = float(fund["holding_shares"] or 0)
+
+        # 逆向计算回撤后的份额
+        new_shares = current_shares - shares if side == "buy" else current_shares + shares
+        if new_shares < 1e-9:
+            new_shares = 0.0
+
+        conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+
+        # 查找删除该条记录后，该基金的最新一笔交易价格
+        last_trade = conn.execute(
+            """
+            SELECT price FROM trades 
+            WHERE fund_id = ? 
+            ORDER BY trade_date DESC, id DESC 
+            LIMIT 1
+            """, 
+            (fund_id,)
+        ).fetchone()
+        
+        # 如果还有历史交易记录，则基准价回滚到上一笔；如果一条也没了，维持最后的状态或者重置（这里选择用回退后的上一笔价格）
+        new_price = float(last_trade["price"]) if last_trade else float(fund["last_trade_price"])
+
+        conn.execute(
+            """
+            UPDATE funds
+            SET holding_shares = ?, last_trade_price = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_shares, new_price, now_iso(), fund_id),
+        )
+
+    return jsonify({"ok": True, "message": "交易已撤销并重算持仓。"})
+
+
+@app.get("/api/get_history_price")
+def get_history_price():
+    code = request.args.get("code", "").strip()
+    date_str = request.args.get("date", "").strip()
+    if not code or not date_str:
+        return jsonify({"error": "缺少 code 或 date 参数"}), 400
+
+    headers = {
+        "Referer": f"http://fundf10.eastmoney.com/jjjz_{code}.html",
+        "User-Agent": "Mozilla/5.0",
+    }
+    url = f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=1&startDate={date_str}&endDate={date_str}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        data = resp.json()
+        items = data.get("Data", {}).get("LSJZList", [])
+        if items and len(items) > 0:
+            price = items[0].get("DWJZ")
+            return jsonify({"price": float(price)})
+        else:
+            return jsonify({"error": "当天未查询到净值，可能非交易日", "price": None})
+    except Exception as e:
+        return jsonify({"error": f"抓取历史净值失败: {str(e)}"}), 500
 
 
 @app.get("/api/health")
