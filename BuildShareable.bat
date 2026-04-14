@@ -65,6 +65,9 @@ set "PYI_WORK=.pyi_work"
 set "PYI_DIST=.pyi_dist"
 set "RELEASE_DIR=release\FundStrategyManager"
 set "RELEASE_ZIP=release\FundStrategyManager.zip"
+set "README_SOURCE=README_SHARE.txt"
+
+if not exist "%README_SOURCE%" set "README_SOURCE=README.md"
 
 if exist "%PYI_WORK%" rmdir /s /q "%PYI_WORK%"
 if exist "%PYI_DIST%" rmdir /s /q "%PYI_DIST%"
@@ -93,7 +96,7 @@ mkdir release 2>nul
 mkdir "%RELEASE_DIR%" 2>nul
 xcopy /E /I /Y "%PYI_DIST%\FundStrategyManager" "%RELEASE_DIR%" >nul
 copy /Y "Run_Portable.bat" "%RELEASE_DIR%\DoubleClickStart.bat" >nul
-copy /Y "README_SHARE.txt" "%RELEASE_DIR%\README.txt" >nul
+copy /Y "%README_SOURCE%" "%RELEASE_DIR%\README.txt" >nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%CD%\%RELEASE_DIR%\*' -DestinationPath '%CD%\%RELEASE_ZIP%' -Force"
 if errorlevel 1 (
