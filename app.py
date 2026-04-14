@@ -27,9 +27,12 @@ else:
 DB_PATH = RUNTIME_DIR / "fund_strategy.db"
 QUOTE_API_TEMPLATE = "https://fundgz.1234567.com.cn/js/{code}.js"
 CACHE_TTL_SECONDS = 45
+GROUP_SEPARATOR = " | "
 
 QUOTE_CACHE: dict[str, dict[str, Any]] = {}
 QUOTE_CACHE_LOCK = threading.Lock()
+HISTORY_PRICE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+HISTORY_PRICE_CACHE_LOCK = threading.Lock()
 
 app = Flask(
     __name__,
@@ -49,6 +52,12 @@ def init_db() -> None:
     with get_db() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS fund_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                sort_order INTEGER DEFAULT 0
+            );
+            
             CREATE TABLE IF NOT EXISTS funds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT NOT NULL UNIQUE,
@@ -71,6 +80,7 @@ def init_db() -> None:
                 shares REAL,
                 price REAL NOT NULL,
                 note TEXT,
+                is_settled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
             );
@@ -97,6 +107,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN shares REAL;")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN is_settled INTEGER NOT NULL DEFAULT 1;")
+        except sqlite3.OperationalError:
+            pass
+
+        # Sync existing groups to the new table
+        conn.execute("INSERT OR IGNORE INTO fund_groups(name) VALUES ('默认分组');")
+        conn.execute("INSERT OR IGNORE INTO fund_groups(name) SELECT DISTINCT group_name FROM funds WHERE group_name != '';")
 
 
 def now_iso() -> str:
@@ -161,6 +179,44 @@ def fetch_quote(code: str, force_refresh: bool = False) -> dict[str, Any] | None
     return quote
 
 
+def fetch_history_price(code: str, date_str: str, force_refresh: bool = False) -> float | None:
+    if not code or not date_str:
+        return None
+
+    cache_key = (code, date_str)
+    now = time.time()
+    if not force_refresh:
+        with HISTORY_PRICE_CACHE_LOCK:
+            cached = HISTORY_PRICE_CACHE.get(cache_key)
+            if cached and (now - cached["ts"] <= CACHE_TTL_SECONDS):
+                return cached["price"]
+
+    headers = {
+        "Referer": f"http://fundf10.eastmoney.com/jjjz_{code}.html",
+        "User-Agent": "Mozilla/5.0",
+    }
+    url = (
+        f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=1"
+        f"&startDate={date_str}&endDate={date_str}"
+    )
+
+    price: float | None = None
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        data = resp.json()
+        items = data.get("Data", {}).get("LSJZList", [])
+        if items and len(items) > 0:
+            dwjz = items[0].get("DWJZ")
+            if dwjz is not None and dwjz != "":
+                price = float(dwjz)
+    except Exception:
+        price = None
+
+    with HISTORY_PRICE_CACHE_LOCK:
+        HISTORY_PRICE_CACHE[cache_key] = {"ts": now, "price": price}
+    return price
+
+
 def get_payload() -> dict[str, Any]:
     if request.is_json:
         payload = request.get_json(silent=True)
@@ -176,6 +232,35 @@ def normalize_mode(mode: str | None) -> str:
     if mode == "holding":
         return "holding"
     return "watch"
+
+
+def split_groups(group_value: str | None) -> list[str]:
+    if not group_value:
+        return []
+    return [part.strip() for part in re.split(r"\s*\|\s*", group_value) if part.strip()]
+
+
+def join_groups(groups: list[str]) -> str:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        name = str(group).strip()
+        if name and name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return GROUP_SEPARATOR.join(merged) if merged else "默认分组"
+
+
+def apply_group_token_change(group_value: str | None, old_name: str | None = None, new_name: str | None = None, remove_name: str | None = None) -> str:
+    groups = split_groups(group_value)
+    updated: list[str] = []
+    for group in groups:
+        if remove_name and group == remove_name:
+            continue
+        if old_name and new_name and group == old_name:
+            group = new_name
+        updated.append(group)
+    return join_groups(updated)
 
 
 def compute_signal(current_price: float | None, base_price: float | None, alert_percent: float = 0.05) -> tuple[str, float | None, float | None]:
@@ -215,12 +300,116 @@ def index() -> str:
     return render_template("index.html")
 
 
+@app.get("/api/groups")
+def list_groups():
+    with get_db() as conn:
+        table_rows = conn.execute("SELECT name FROM fund_groups ORDER BY sort_order ASC, id ASC").fetchall()
+        fund_rows = conn.execute("SELECT group_name FROM funds").fetchall()
+
+    groups: list[str] = []
+    seen: set[str] = set()
+    for row in table_rows:
+        name = str(row["name"]).strip()
+        if name and name not in seen:
+            seen.add(name)
+            groups.append(name)
+    for row in fund_rows:
+        for name in split_groups(row["group_name"]):
+            if name not in seen:
+                seen.add(name)
+                groups.append(name)
+    return jsonify({"groups": groups})
+
+
+@app.post("/api/groups")
+def create_group():
+    payload = get_payload()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "分组名称不能为空"}), 400
+    try:
+        with get_db() as conn:
+            conn.execute("INSERT INTO fund_groups(name) VALUES (?)", (name,))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "该分组已存在"}), 409
+    return jsonify({"ok": True, "message": "分组已创建"})
+
+
+@app.put("/api/groups/<string:old_name>")
+def rename_group(old_name: str):
+    payload = get_payload()
+    new_name = str(payload.get("new_name", "")).strip()
+    if not new_name:
+        return jsonify({"error": "新名称不能为空"}), 400
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE fund_groups SET name = ? WHERE name = ?", (new_name, old_name))
+            rows = conn.execute("SELECT id, group_name FROM funds").fetchall()
+            for row in rows:
+                updated = apply_group_token_change(row["group_name"], old_name=old_name, new_name=new_name)
+                if updated != row["group_name"]:
+                    conn.execute("UPDATE funds SET group_name = ? WHERE id = ?", (updated, row["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "目标分组已存在"}), 409
+    return jsonify({"ok": True, "message": "分组已重命名"})
+
+
+@app.delete("/api/groups/<string:name>")
+def delete_group(name: str):
+    if name == "默认分组":
+        return jsonify({"error": "系统默认分组不可删除"}), 400
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, group_name FROM funds").fetchall()
+        for row in rows:
+            updated = apply_group_token_change(row["group_name"], remove_name=name)
+            if not split_groups(updated):
+                updated = "默认分组"
+            if updated != row["group_name"]:
+                conn.execute("UPDATE funds SET group_name = ? WHERE id = ?", (updated, row["id"]))
+        conn.execute("DELETE FROM fund_groups WHERE name = ?", (name,))
+    return jsonify({"ok": True, "message": "分组已删除，关联基金已移至默认分组"})
+
+
 @app.get("/api/funds")
 def list_funds():
     force_refresh = request.args.get("force") == "1"
     with get_db() as conn:
         funds = conn.execute("SELECT * FROM funds ORDER BY id DESC").fetchall()
         trade_summaries = load_trade_summaries(conn)
+        
+        # 统计每个基金的交易记录
+        trade_counts = {}
+        trade_rows = conn.execute("SELECT fund_id, COUNT(*) as cnt FROM trades GROUP BY fund_id").fetchall()
+        for row in trade_rows:
+            trade_counts[row["fund_id"]] = int(row["cnt"])
+
+        pending_rows = conn.execute(
+            """
+            SELECT
+                fund_id,
+                MIN(trade_date) AS earliest_pending_date,
+                SUM(CASE WHEN side = 'buy' THEN COALESCE(shares, 0) ELSE 0 END) AS pending_buy_shares,
+                SUM(CASE WHEN side = 'buy' THEN COALESCE(amount, 0) ELSE 0 END) AS pending_buy_amount,
+                SUM(CASE WHEN side = 'sell' THEN COALESCE(shares, 0) ELSE 0 END) AS pending_sell_shares,
+                SUM(CASE WHEN side = 'sell' THEN COALESCE(amount, 0) ELSE 0 END) AS pending_sell_amount,
+                COUNT(*) AS pending_count
+            FROM trades
+            WHERE is_settled = 0
+            GROUP BY fund_id
+            """
+        ).fetchall()
+
+    pending_summaries: dict[int, dict[str, Any]] = {}
+    for row in pending_rows:
+        earliest_pending_date = str(row["earliest_pending_date"] or "")
+        pending_summaries[int(row["fund_id"])] = {
+            "earliest_pending_date": earliest_pending_date,
+            "pending_buy_shares": float(row["pending_buy_shares"] or 0),
+            "pending_buy_amount": float(row["pending_buy_amount"] or 0),
+            "pending_sell_shares": float(row["pending_sell_shares"] or 0),
+            "pending_sell_amount": float(row["pending_sell_amount"] or 0),
+            "pending_count": int(row["pending_count"] or 0),
+        }
 
     data: list[dict[str, Any]] = []
     summary_market_value = 0.0
@@ -230,7 +419,7 @@ def list_funds():
     for fund in funds:
         fund_id = int(fund["id"])
         code = fund["code"]
-        group_name = fund["group_name"]
+        group_name = join_groups(split_groups(fund["group_name"]))
         alert_percent = float(fund["alert_percent"])
         
         quote = fetch_quote(code, force_refresh=force_refresh)
@@ -255,6 +444,34 @@ def list_funds():
 
         summary_market_value += market_value
         summary_pnl += cumulative_pnl
+        
+        # 自动确定状态：有交易记录且市值>0则为holding，否则为watch
+        auto_mode = fund["mode"]
+        has_trades = trade_counts.get(fund_id, 0) > 0
+        if has_trades and market_value > 1e-9:
+            auto_mode = "holding"
+        elif not has_trades or abs(market_value) < 1e-9:
+            auto_mode = "watch"
+
+        pending_summary = pending_summaries.get(fund_id, {
+            "earliest_pending_date": "",
+            "pending_buy_shares": 0.0,
+            "pending_buy_amount": 0.0,
+            "pending_sell_shares": 0.0,
+            "pending_sell_amount": 0.0,
+            "pending_count": 0,
+        })
+
+        # 文案切换逻辑：当交易日净值已可获取时，显示“买入中/赎回中”；否则显示“待买入/待卖出”。
+        pending_display_mode = "pending"
+        pending_price = None
+        if pending_summary["pending_count"] > 0 and pending_summary["earliest_pending_date"]:
+            pending_price = fetch_history_price(code, pending_summary["earliest_pending_date"], force_refresh=force_refresh)
+            if pending_price is not None:
+                pending_display_mode = "settling"
+        
+        # 持仓份额四舍五入保留两位
+        rounded_shares = round(shares, 2)
 
         data.append(
             {
@@ -263,9 +480,9 @@ def list_funds():
                 "name": display_name,
                 "group_name": group_name,
                 "alert_percent": alert_percent,
-                "mode": fund["mode"],
+                "mode": auto_mode,
                 "last_trade_price": base_price,
-                "holding_shares": shares,
+                "holding_shares": rounded_shares,
                 "current_price": current_price,
                 "latest_nav": latest_nav,
                 "daily_change_pct": daily_change_pct,
@@ -276,6 +493,13 @@ def list_funds():
                 "market_value": market_value,
                 "buy_total": trade_info["buy_total"],
                 "sell_total": trade_info["sell_total"],
+                "pending_buy_shares": pending_summary["pending_buy_shares"],
+                "pending_buy_amount": pending_summary["pending_buy_amount"],
+                "pending_sell_shares": pending_summary["pending_sell_shares"],
+                "pending_sell_amount": pending_summary["pending_sell_amount"],
+                "pending_count": pending_summary["pending_count"],
+                "pending_display_mode": pending_display_mode,
+                "pending_price": pending_price,
                 "cumulative_pnl": cumulative_pnl,
                 "updated_at": fund["updated_at"],
                 "quote_available": quote is not None,
@@ -295,6 +519,57 @@ def list_funds():
         }
     )
 
+
+@app.get("/api/quote")
+def quote_api():
+    code = request.args.get("code", "")
+    if not validate_fund_code(code):
+        return jsonify({"error": "Invalid code"}), 400
+    q = fetch_quote(code, force_refresh=True)
+    if q:
+        return jsonify({"name": q.get("name", ""), "price": q.get("current_price") or q.get("latest_nav")})
+    return jsonify({"name": "", "price": None})
+
+@app.post("/api/funds/batch")
+def batch_create_funds():
+    payload = get_payload()
+    codes_str = str(payload.get("codes", ""))
+    codes = set(re.findall(r"\d{6}", codes_str))
+    if not codes:
+        return jsonify({"error": "未发现有效的6位基金代码。"}), 400
+    
+    success_count = 0
+    errors = []
+    created_at = now_iso()
+    with get_db() as conn:
+        for code in codes:
+            try:
+                quote = fetch_quote(code, force_refresh=False)
+                name = quote.get("name") if quote else code
+                if quote and quote.get("current_price"):
+                    last_trade_price = float(quote["current_price"])
+                elif quote and quote.get("latest_nav"):
+                    last_trade_price = float(quote["latest_nav"])
+                else:
+                    last_trade_price = 0.0
+                
+                conn.execute(
+                    """
+                    INSERT INTO funds(code, name, mode, last_trade_price, holding_shares, group_name, alert_percent, created_at, updated_at)
+                    VALUES (?, ?, 'watch', ?, 0, '默认分组', 0.05, ?, ?)
+                    """,
+                    (code, name, last_trade_price, created_at, created_at),
+                )
+                success_count += 1
+            except sqlite3.IntegrityError:
+                errors.append(f"{code}(已存在)")
+            except Exception as e:
+                errors.append(f"{code}(错误)")
+    
+    msg = f"成功导入 {success_count} 只基金。"
+    if errors:
+        msg += f" 失败: {', '.join(errors)}"
+    return jsonify({"ok": True, "message": msg})
 
 @app.post("/api/funds")
 def create_fund():
@@ -319,8 +594,10 @@ def create_fund():
     if last_trade_price is None or last_trade_price <= 0:
         if quote and quote.get("current_price"):
             last_trade_price = float(quote["current_price"])
+        elif quote and quote.get("latest_nav"):
+            last_trade_price = float(quote["latest_nav"])
         else:
-            return jsonify({"error": "请填写最近一次成交价，或稍后重试行情拉取。"}), 400
+            last_trade_price = 0.0
 
     if shares > 0 and mode == "watch":
         mode = "holding"
@@ -426,7 +703,7 @@ def list_trades(fund_id: int):
 
         rows = conn.execute(
             """
-            SELECT id, trade_date, side, shares, price, note, created_at
+            SELECT id, trade_date, side, shares, price, note, is_settled, created_at
             FROM trades
             WHERE fund_id = ?
             ORDER BY trade_date DESC, id DESC
@@ -446,6 +723,7 @@ def list_trades(fund_id: int):
                     "price": float(row["price"]),
                     "amount": float(row["shares"]) * float(row["price"]),
                     "note": row["note"] or "",
+                    "is_settled": bool(row["is_settled"]),
                     "created_at": row["created_at"],
                 }
                 for row in rows
@@ -494,6 +772,9 @@ def create_trade(fund_id: int):
 
     note = str(payload.get("note", "")).strip()
     created_at = now_iso()
+    
+    # 判断是否为当日交易（未结算）
+    is_settled = 1 if trade_date != dt.date.today().isoformat() else 0
 
     with get_db() as conn:
         fund = conn.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()
@@ -501,31 +782,164 @@ def create_trade(fund_id: int):
             return jsonify({"error": "基金不存在。"}), 404
 
         current_shares = float(fund["holding_shares"] or 0)
-        if side == "sell" and shares > current_shares:
+        if side == "sell" and shares > current_shares and is_settled:
             return jsonify({"error": "卖出份额不能大于当前持仓份额。"}), 400
 
-        new_shares = current_shares + shares if side == "buy" else current_shares - shares
-        if abs(new_shares) < 1e-9:
-            new_shares = 0.0
+        # 当日交易：不更新持仓和基准价，等待第二天或价格更新
+        if is_settled:
+            new_shares = current_shares + shares if side == "buy" else current_shares - shares
+            if abs(new_shares) < 1e-9:
+                new_shares = 0.0
+            update_price = price
+        else:
+            # 当日交易：暂不更新持仓和价格
+            new_shares = current_shares
+            update_price = float(fund["last_trade_price"] or 1.0)
 
         conn.execute(
             """
-            INSERT INTO trades(fund_id, trade_date, side, amount, shares, price, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades(fund_id, trade_date, side, amount, shares, price, note, is_settled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (fund_id, trade_date, side, amount, shares, price, note, created_at),
+            (fund_id, trade_date, side, amount, shares, price, note, is_settled, created_at),
         )
-        conn.execute(
-            """
-            UPDATE funds
-            SET holding_shares = ?, last_trade_price = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (new_shares, price, created_at, fund_id),
-        )
+        
+        # 仅当is_settled=1时才更新基金的持仓和基准价
+        if is_settled:
+            conn.execute(
+                """
+                UPDATE funds
+                SET holding_shares = ?, last_trade_price = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_shares, update_price, created_at, fund_id),
+            )
 
-    return jsonify({"ok": True, "message": "交易已录入并更新基准价。"})
+    msg = "交易已录入并更新基准价。" if is_settled else "交易已提交为待处理状态，将在第二天或晚间价格更新后自动结算。"
+    return jsonify({"ok": True, "message": msg})
 
+
+@app.post("/api/funds/<int:fund_id>/trades/batch")
+def batch_create_trades(fund_id: int):
+    payload = get_payload()
+    trades = payload.get("trades", [])
+    trades_data = str(payload.get("trades_data", "")).strip()
+    
+    # 支持两种格式：新格式(trades 数组)和老格式(trades_data 字符串)
+    if trades_data and not trades:
+        # 老格式：文本行处理
+        lines = trades_data.split('\n')
+    elif trades:
+        # 新格式：trades 数组直接处理
+        lines = trades
+    else:
+        return jsonify({"error": "数据为空"}), 400
+    
+    success_count = 0
+    pending_count = 0
+    created_at = now_iso()
+    today = dt.date.today().isoformat()
+    
+    with get_db() as conn:
+        fund = conn.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()
+        if not fund:
+            return jsonify({"error": "基金不存在"}), 404
+            
+        current_shares = float(fund["holding_shares"] or 0)
+        last_trade_price = float(fund["last_trade_price"] or 1.0)
+        
+        # 处理每条交易记录
+        for trade_item in lines:
+            # 兼容两种格式
+            if isinstance(trade_item, str):
+                # 老格式：文本行
+                parts = trade_item.strip().split()
+                if len(parts) < 4:
+                    continue
+                    
+                trade_date = parts[0]
+                try:
+                    dt.date.fromisoformat(trade_date)
+                except ValueError:
+                    continue
+                    
+                side_str = parts[1]
+                side = "buy" if "买" in side_str else "sell" if "卖" in side_str else None
+                if not side: continue
+                
+                try:
+                    price = float(parts[2])
+                    shares = float(parts[3])
+                    amount = price * shares
+                except ValueError:
+                    continue
+                    
+                note = " ".join(parts[4:]) if len(parts) > 4 else "批量导入"
+            else:
+                # 新格式：字典对象
+                trade_date = trade_item.get("trade_date", "").strip()
+                side = trade_item.get("side", "").strip()
+                note = trade_item.get("note", "批量导入")
+                
+                try:
+                    dt.date.fromisoformat(trade_date)
+                except ValueError:
+                    continue
+                    
+                if side not in ("buy", "sell"):
+                    continue
+                
+                # 从trade_item中获取price, shares, amount
+                price = trade_item.get("price")
+                shares = trade_item.get("shares")
+                amount = trade_item.get("amount")
+                
+                if not price or not shares:
+                    # 如果没有提供，跳过
+                    continue
+                    
+                try:
+                    price = float(price)
+                    shares = float(shares)
+                    amount = float(amount) if amount else (price * shares)
+                except (ValueError, TypeError):
+                    continue
+            
+            # 判断是否为当日交易
+            is_settled = 1 if trade_date != today else 0
+            
+            # 仅当is_settled=1时才更新current_shares
+            if is_settled:
+                new_shares = current_shares + shares if side == "buy" else current_shares - shares
+                if new_shares < 0: new_shares = 0.0
+                current_shares = new_shares
+                last_trade_price = price
+            
+            conn.execute(
+                """
+                INSERT INTO trades(fund_id, trade_date, side, amount, shares, price, note, is_settled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (fund_id, trade_date, side, amount, shares, price, note, is_settled, created_at),
+            )
+            success_count += 1
+            if is_settled == 0:
+                pending_count += 1
+            
+        if success_count > 0:
+            conn.execute(
+                """
+                UPDATE funds
+                SET holding_shares = ?, last_trade_price = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (current_shares, last_trade_price, created_at, fund_id),
+            )
+            
+    msg = f"成功导入 {success_count} 笔交易记录"
+    if pending_count > 0:
+        msg += f" ({pending_count} 笔待处理)"
+    return jsonify({"ok": True, "message": msg})
 
 @app.delete("/api/funds/<int:fund_id>/trades/<int:trade_id>")
 def delete_trade(fund_id: int, trade_id: int):
@@ -575,6 +989,98 @@ def delete_trade(fund_id: int, trade_id: int):
     return jsonify({"ok": True, "message": "交易已撤销并重算持仓。"})
 
 
+@app.post("/api/funds/<int:fund_id>/settle_pending_trades")
+def settle_pending_trades(fund_id: int):
+    """处理待处理的T+0交易，在T+1时将其标记为已结算"""
+    now = dt.datetime.now()
+    today = now.date().isoformat()
+
+    if now.hour < 15:
+        return jsonify({"ok": True, "settled_count": 0, "message": "尚未到结算时间。"})
+    
+    with get_db() as conn:
+        fund = conn.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()
+        if not fund:
+            return jsonify({"error": "基金不存在。"}), 404
+        
+        # 查询昨日未结算的交易
+        pending_trades = conn.execute(
+            """
+            SELECT id, trade_date, side, amount, shares, price
+            FROM trades
+            WHERE fund_id = ? AND is_settled = 0 AND trade_date < ?
+            ORDER BY trade_date ASC, id ASC
+            """,
+            (fund_id, today)
+        ).fetchall()
+        
+        if not pending_trades:
+            return jsonify({"ok": True, "settled_count": 0, "message": "没有待结算的交易。"})
+        
+        settled_count = 0
+        current_shares = float(fund["holding_shares"] or 0)
+        last_price = float(fund["last_trade_price"] or 1.0)
+        
+        for trade in pending_trades:
+            trade_date = trade["trade_date"]
+            side = trade["side"]
+            raw_amount = float(trade["amount"] or 0)
+            raw_shares = float(trade["shares"] or 0)
+
+            # 结算时优先使用交易日净值；拿不到时回退到录入价格。
+            settlement_price = fetch_history_price(str(fund["code"]), str(trade_date), force_refresh=True)
+            if settlement_price is None:
+                settlement_price = float(trade["price"])
+
+            if side == "buy":
+                amount = raw_amount if raw_amount > 0 else raw_shares * settlement_price
+                shares = amount / settlement_price if settlement_price > 0 else raw_shares
+            else:
+                shares = raw_shares if raw_shares > 0 else (raw_amount / settlement_price if settlement_price > 0 else 0)
+                amount = shares * settlement_price
+            price = settlement_price
+            
+            # 更新持仓
+            if side == "buy":
+                current_shares += shares
+            else:
+                current_shares -= shares
+                if current_shares < 1e-9:
+                    current_shares = 0.0
+            
+            # 更新基准价
+            last_price = price
+
+            conn.execute(
+                """
+                UPDATE trades
+                SET amount = ?, shares = ?, price = ?
+                WHERE id = ?
+                """,
+                (amount, shares, price, trade["id"]),
+            )
+            
+            # 标记为已结算
+            conn.execute(
+                "UPDATE trades SET is_settled = 1 WHERE id = ?",
+                (trade["id"],)
+            )
+            settled_count += 1
+        
+        # 更新基金持仓和价格
+        if settled_count > 0:
+            conn.execute(
+                """
+                UPDATE funds
+                SET holding_shares = ?, last_trade_price = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (current_shares, last_price, now_iso(), fund_id),
+            )
+        
+        return jsonify({"ok": True, "settled_count": settled_count, "message": f"成功结算 {settled_count} 笔待处理交易。"})
+
+
 @app.get("/api/get_history_price")
 def get_history_price():
     code = request.args.get("code", "").strip()
@@ -582,22 +1088,10 @@ def get_history_price():
     if not code or not date_str:
         return jsonify({"error": "缺少 code 或 date 参数"}), 400
 
-    headers = {
-        "Referer": f"http://fundf10.eastmoney.com/jjjz_{code}.html",
-        "User-Agent": "Mozilla/5.0",
-    }
-    url = f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=1&startDate={date_str}&endDate={date_str}"
-    try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        data = resp.json()
-        items = data.get("Data", {}).get("LSJZList", [])
-        if items and len(items) > 0:
-            price = items[0].get("DWJZ")
-            return jsonify({"price": float(price)})
-        else:
-            return jsonify({"error": "当天未查询到净值，可能非交易日", "price": None})
-    except Exception as e:
-        return jsonify({"error": f"抓取历史净值失败: {str(e)}"}), 500
+    price = fetch_history_price(code, date_str, force_refresh=True)
+    if price is None:
+        return jsonify({"error": "当天未查询到净值，可能非交易日", "price": None})
+    return jsonify({"price": price})
 
 
 @app.get("/api/health")

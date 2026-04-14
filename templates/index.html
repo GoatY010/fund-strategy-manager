@@ -21,52 +21,21 @@
         </header>
 
         <section class="panel">
-            <h2>添加基金 / 初始化持仓</h2>
-            <form id="addFundForm" class="form-grid">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h2 style="margin: 0;">添加基金</h2>
+                <button type="button" class="btn btn-ghost" id="openBatchAddBtn">批量导入</button>
+            </div>
+            <form id="addFundForm" class="form-grid compact" style="margin-top: 1rem;">
                 <label>
                     基金代码
                     <input type="text" name="code" id="addCode" required maxlength="6" pattern="\d{6}" placeholder="例如 161725">
                 </label>
                 <label>
-                    交易日期
-                    <input type="date" name="trade_date" id="addTradeDate" required>
+                    基金名称
+                    <input type="text" id="addName" readonly placeholder="输入代码自动获取" style="background:var(--bg-b); color:var(--ink-soft);">
                 </label>
-                <label>
-                    所属分组
-                    <input type="text" name="group_name" id="addGroup" list="groupList" placeholder="如: 宽基/行业" value="默认分组" required>
-                    <datalist id="groupList"></datalist>
-                </label>
-                <label>
-                    预警比例
-                    <select name="alert_percent">
-                        <option value="0.01">1%</option>
-                        <option value="0.02">2%</option>
-                        <option value="0.03">3%</option>
-                        <option value="0.05" selected>5%</option>
-                        <option value="0.10">10%</option>
-                    </select>
-                </label>
-                <label>
-                    状态
-                    <select name="mode">
-                        <option value="watch">仅观察</option>
-                        <option value="holding">实际持有</option>
-                    </select>
-                </label>
-                <label>
-                    金额(¥) 或 份额(份)
-                    <input type="number" name="amount_or_shares" id="addAmountShares" min="0" step="0.01" value="0" required>
-                </label>
-                <label>
-                    上次成交单价
-                    <div style="display:flex; gap:0.5rem;">
-                        <input type="number" name="last_trade_price" id="addPrice" min="0" step="0.0001" placeholder="自动查价" required style="width: 100%;">
-                        <button type="button" class="btn btn-ghost" id="fetchAddPriceBtn" style="padding: 0 0.5rem;" title="点击尝试通过日期获取价格">查</button>
-                    </div>
-                </label>
-                <button type="submit" class="btn btn-strong">确认添加基金</button>
+                <button type="submit" class="btn btn-strong" style="grid-column: 1 / -1;">确认添加基金</button>
             </form>
-            <p class="muted">提示: 初始化买入时金额/份额只填一个就会按单价自动转换。离开日期框会自动查价。</p>
         </section>
 
         <section class="panel">
@@ -94,10 +63,14 @@
         <section class="panel">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
                 <h2 style="margin: 0;">基金监控列表</h2>
-                <div id="groupTabs" class="group-tabs">
-                    <button class="tab-btn active" data-group="全部">全部</button>
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                    <div id="groupTabs" class="group-tabs">
+                        <button class="tab-btn active" data-group="全部">全部</button>
+                    </div>
+                    <button type="button" class="btn btn-ghost" id="manageGroupsBtn" style="padding: 0.3rem 0.5rem; font-size:0.8rem;">管理分组</button>
                 </div>
             </div>
+            <div id="groupSummary" class="group-summary" style="margin-bottom:1rem; padding:0.8rem; background:var(--bg-b,#f5f5f5); border-radius:8px; display:flex; align-items:center; gap:2rem; font-size:0.9rem;"></div>
             <p class="muted" style="margin-bottom:10px; font-size:0.8rem;">提示：拖拽表头文字即可调整列顺序。</p>
             <div class="table-wrap">
                 <table id="sortableTable">
@@ -140,13 +113,6 @@
                 <input type="text" name="name" required>
             </label>
             <label>
-                状态
-                <select name="mode">
-                    <option value="watch">仅观察</option>
-                    <option value="holding">实际持有</option>
-                </select>
-            </label>
-            <label>
                 预警比例
                 <select name="alert_percent">
                     <option value="0.01">1%</option>
@@ -155,11 +121,6 @@
                     <option value="0.05">5%</option>
                     <option value="0.10">10%</option>
                 </select>
-            </label>
-            <label>
-                所属分组
-                <input type="text" name="group_name" list="groupListEdit" required>
-                <datalist id="groupListEdit"></datalist>
             </label>
             <label>
                 持仓份额
@@ -177,7 +138,10 @@
         <form method="dialog" class="dialog-close-row">
             <button class="btn btn-ghost" value="cancel">关闭</button>
         </form>
-        <h3 id="tradeDialogTitle">交易录入</h3>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h3 id="tradeDialogTitle" style="margin:0;">交易录入</h3>
+            <button type="button" class="btn btn-ghost" id="openBatchTradeBtn" style="padding: 0.3rem 0.5rem; font-size:0.8rem;">批量导入记录</button>
+        </div>
         <form id="tradeForm" class="form-grid compact">
             <input type="hidden" name="fund_id">
             <input type="hidden" id="tradeCode">
@@ -214,8 +178,8 @@
             <button type="submit" class="btn btn-strong" style="grid-column: 1 / -1;">确认交易</button>
         </form>
         
-        <div class="table-wrap" style="margin-top: 1rem;">
-            <table>
+        <div class="trade-history-wrap" style="margin-top: 1rem;">
+            <table id="tradeHistoryTable" style="width: 100%;">
                 <thead>
                     <tr>
                         <th>日期</th>
@@ -223,18 +187,116 @@
                         <th>份额</th>
                         <th>单价</th>
                         <th>金额</th>
-                        <th>备注</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="tradeTableBody">
                     <tr>
-                        <td colspan="7" class="empty">加载中...</td>
+                        <td colspan="6" class="empty">加载中...</td>
                     </tr>
                 </tbody>
             </table>
         </div>
     </dialog>
+
+    <dialog id="batchAddFundDialog" class="dialog">
+        <form method="dialog" class="dialog-close-row">
+            <button class="btn btn-ghost" value="cancel">关闭</button>
+        </form>
+        <h3>批量导入基金</h3>
+        <form id="batchAddFundForm" class="form-grid compact">
+            <label style="grid-column: 1 / -1;">
+                输入多只基金代码 (用空格或换行分隔)
+                <textarea name="codes" id="batchAddCodes" rows="8" required placeholder="例如：\n161725\n510300\n005827"></textarea>
+            </label>
+            <button type="submit" class="btn btn-strong" style="grid-column: 1 / -1;">提交导入</button>
+        </form>
+    </dialog>
+
+    <dialog id="batchTradeDialog" class="dialog dialog-wide">
+        <div class="dialog-close-row">
+            <button type="button" class="btn btn-ghost" data-close-dialog="true">返回</button>
+        </div>
+        <h3>批量导入交易记录</h3>
+        <p class="muted" style="margin-bottom: 1rem; font-size: 0.9rem;">
+            <strong>说明：</strong>输入日期、选择方向并填入金额（买入）或份额（卖出）。当日交易将显示"待买入/卖出"标注。
+        </p>
+        
+        <div class="table-wrap" style="margin-bottom: 1rem;">
+            <table id="batchTradeTable">
+                <thead>
+                    <tr>
+                        <th>日期</th>
+                        <th>方向</th>
+                        <th>金额(元) / 份额</th>
+                    </tr>
+                </thead>
+                <tbody id="batchTradeBody">
+                    <tr class="batch-trade-row" data-row-id="row-0">
+                        <td><input type="date" class="batch-date" required></td>
+                        <td>
+                            <select class="batch-side" required>
+                                <option value="">请选择</option>
+                                <option value="buy">买入</option>
+                                <option value="sell">卖出</option>
+                            </select>
+                        </td>
+                        <td><input type="number" class="batch-value" min="0" step="0.01" placeholder="金额（买入）或份额（卖出）" required></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <div style="margin-bottom:1rem;">
+            <button type="button" class="btn btn-sm" onclick="addBatchTradeRow()" style="background: #d7f5e3; color: #1e7147; border: 1px solid #1e7147; margin-bottom:0.5rem;">+ 添加交易行</button>
+        </div>
+        <div style="margin-bottom:1.5rem;">
+            <button type="button" class="btn btn-strong" onclick="submitBatchTrades()" style="width:100%;">确认导入</button>
+        </div>
+        
+        <div class="batch-preview-wrap">
+            <p style="font-weight: bold; margin-bottom: 0.5rem; margin-top: 0;">导入预览：</p>
+            <table id="batchPreviewTable" style="width: 100%;">
+                <thead>
+                    <tr>
+                        <th>日期</th>
+                        <th>方向</th>
+                        <th>金额/份额</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody id="batchTradePreviewBody">
+                    <tr><td colspan="4" class="empty">填入数据后自动预览</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </dialog>
+    
+    <dialog id="manageGroupsDialog" class="dialog" onclick="if(event.target.id === 'manageGroupsDialog') this.close();">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+            <h3 style="margin:0">管理分组</h3>
+            <button type="button" class="btn btn-ghost" data-close-dialog="true" style="padding:0.3rem 0.6rem; font-size:0.9rem;">关闭</button>
+        </div>
+        <form id="addGroupForm" style="display:flex; gap:0.5rem; margin-bottom:1rem;">
+            <input type="text" id="newGroupName" placeholder="新分组名称" required style="flex:1; border:1px solid var(--border); border-radius:10px; padding:0.45rem; font-size:0.75rem;">
+            <button type="submit" class="btn btn-strong" style="font-size:0.75rem; padding:0.4rem 0.7rem;">添加</button>
+        </form>
+        <ul id="groupsListUI" style="list-style:none; padding:0; margin:0;">
+            <!-- Render groups here with rename/delete buttons -->
+        </ul>
+    </dialog>
+
+    <div id="nameActionDialog" class="name-action-dialog hidden" aria-hidden="true">
+        <div class="name-action-backdrop" data-action="close"></div>
+        <div class="name-action-panel" role="dialog" aria-modal="true" aria-labelledby="nameActionTitle">
+            <div class="name-action-panel-head">
+                <button type="button" class="btn btn-ghost" data-action="back" id="nameActionBackBtn" style="display:none;">返回</button>
+                <h3 id="nameActionTitle" class="name-action-title">基金操作</h3>
+                <button type="button" class="btn btn-ghost" data-action="close">关闭</button>
+            </div>
+            <div id="nameActionBody" class="name-action-body"></div>
+        </div>
+    </div>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
