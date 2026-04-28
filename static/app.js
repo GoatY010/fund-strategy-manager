@@ -1,10 +1,18 @@
-// == Utils ==
+﻿// == Utils ==
 function $(selector) {
     return document.querySelector(selector);
 }
 
 function $$(selector) {
     return document.querySelectorAll(selector);
+}
+
+function getColorClass(value) {
+    /**
+     * 根据数值返回颜色类名。
+     * 正数: "color-up", 负数: "color-down", 零或其他: ""
+     */
+    return value > 0 ? "color-up" : (value < 0 ? "color-down" : "");
 }
 
 function formatDate(ds) {
@@ -34,6 +42,39 @@ function escapeHtml(text) {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
+}
+
+function buildTradeSubtitleParts(fund) {
+    // 这里只拼名称下方的展示文案，不参与结算状态判断。
+    const parts = [];
+
+    const yesterdayCount = Number(fund.subtitle_yesterday_trade_count || 0);
+    if (yesterdayCount > 0) {
+        const buyAmount = Number(fund.subtitle_yesterday_buy_amount || 0);
+        const sellShares = Number(fund.subtitle_yesterday_sell_shares || 0);
+
+        if (buyAmount > 0) {
+            parts.push(`一笔买入中，合计${formatMoney(buyAmount)}`);
+        }
+        if (sellShares > 0) {
+            parts.push(`一笔卖出中，合计${formatNumber(sellShares)}份`);
+        }
+    }
+
+    const todayCount = Number(fund.subtitle_today_trade_count || 0);
+    if (todayCount > 0) {
+        const buyAmount = Number(fund.subtitle_today_buy_amount || 0);
+        const sellShares = Number(fund.subtitle_today_sell_shares || 0);
+
+        if (buyAmount > 0) {
+            parts.push(`待买入，合计${formatMoney(buyAmount)}`);
+        }
+        if (sellShares > 0) {
+            parts.push(`待卖出，合计${formatNumber(sellShares)}份`);
+        }
+    }
+
+    return parts;
 }
 
 function splitGroups(groupValue) {
@@ -69,28 +110,44 @@ async function requestJSON(url, options = {}) {
     if (!options.headers["Content-Type"] && !options.body) {
         options.headers["Accept"] = "application/json";
     }
-    const resp = await fetch(url, options);
-    if (!resp.ok) {
-        let msg = "请求失败";
-        try {
-            const err = await resp.json();
-            if (err.error) msg = err.error;
-        } catch (e) {}
-        throw new Error(msg);
+    
+    // 添加超时控制（10秒）
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    
+    try {
+        const resp = await fetch(url, { cache: "no-store", ...options, signal: controller.signal });
+        if (!resp.ok) {
+            let msg = "请求失败";
+            try {
+                const err = await resp.json();
+                if (err.error) msg = err.error;
+            } catch (e) {}
+            throw new Error(msg);
+        }
+        return resp.json();
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            throw new Error('请求超时，请检查网络');
+        }
+        throw err;
+    } finally {
+        clearTimeout(timeout);
     }
-    return resp.json();
 }
 
 // == State ==
 let allFunds = [];
 let allGroupNames = [];
 let currentGroup = "全部";
+let currentTradeDialogFundId = null;  // 当前交易对话框的基金ID（用于自动更新价格）
 let nameActionDialogEl = null;
 let nameActionTitleEl = null;
 let nameActionBodyEl = null;
 let nameActionState = {
     fundId: null,
     fundName: "",
+    fundGroups: "",
     mode: "main",
 };
 
@@ -101,33 +158,47 @@ const COLS = [
     { field: "mode", label: "状态" },
     { field: "last_trade_price", label: "上次成交" },
     { field: "current_price", label: "当前估值" },
-    { field: "daily_change_pct", label: "今日涨跌" },
     { field: "buy_line", label: "买入线" },
     { field: "sell_line", label: "卖出线" },
     { field: "signal", label: "信号" },
     { field: "holding_shares", label: "持仓份额" },
+    { field: "yesterday_change_pct", label: "昨日涨跌" },
+    { field: "daily_change_pct", label: "今日涨跌" },
+    { field: "daily_pnl", label: "当日盈利" },
     { field: "market_value", label: "市值" },
-    { field: "cumulative_pnl", label: "累计盈亏" },
+    { field: "cumulative_pnl", label: "持有收益" },
     { field: "actions", label: "操作" }
 ];
 
-let columnOrder = localStorage.getItem("columnOrder");
-if (columnOrder) {
-    columnOrder = JSON.parse(columnOrder);
-    // ensure all fields exist
+// 通用localStorage加载函数
+function loadStorage(key, defaultValue) {
+    try {
+        const item = localStorage.getItem(key);
+        return item ? JSON.parse(item) : defaultValue;
+    } catch (e) {
+        return defaultValue;
+    }
+}
+
+let columnOrder = loadStorage("columnOrder", null);
+if (!columnOrder || !Array.isArray(columnOrder)) {
+    columnOrder = COLS.map(c => c.field);
+} else {
+    // verify existing columns are valid
     const currentFields = COLS.map(c => c.field);
     if (columnOrder.length !== currentFields.length || columnOrder.some(f => !currentFields.includes(f))) {
         columnOrder = currentFields;
     }
-} else {
-    columnOrder = COLS.map(c => c.field);
 }
 
 // 列宽度管理
-let columnWidths = localStorage.getItem("columnWidths");
-columnWidths = columnWidths ? JSON.parse(columnWidths) : {};
+let columnWidths = loadStorage("columnWidths", {});
 let resizingField = null;
 let resizeStartX = 0;
+
+// 行排序管理
+let fundRowOrder = loadStorage("fundRowOrder", []);
+let draggedFundId = null;
 
 
 // == Initialization ==
@@ -139,7 +210,24 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Events
-    $("#refreshBtn").addEventListener("click", () => loadData(true));
+    const refreshBtn = $("#refreshBtn");
+    if (refreshBtn) {
+        refreshBtn.addEventListener("click", async (e) => {
+            e.preventDefault();
+            const btn = $("#refreshBtn");
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = "刷新中...";
+            try {
+                await loadData(true);
+            } catch (err) {
+                alert("刷新失败: " + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        });
+    }
     $("#addFundForm").addEventListener("submit", handleAddFund);
     $("#editFundForm").addEventListener("submit", handleEditFund);
     $("#tradeForm").addEventListener("submit", handleTrade);
@@ -147,8 +235,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // Auto fetch prices
     $("#addCode").addEventListener("input", autoFetchAddName);
 
-    if ($("#tradeDate")) $("#tradeDate").addEventListener("blur", autoFetchTradePrice);
+    if ($("#tradeDate")) {
+        $("#tradeDate").addEventListener("change", autoFetchTradePrice);
+    }
     if ($("#fetchTradePriceBtn")) $("#fetchTradePriceBtn").addEventListener("click", autoFetchTradePrice);
+
+    // 监听交易对话框关闭事件，清除当前打开的对话框基金ID
+    const tradeDialog = $("#tradeDialog");
+    if (tradeDialog) {
+        tradeDialog.addEventListener("close", () => {
+            currentTradeDialogFundId = null;
+        });
+    }
 
     // Batch Add & Manage Groups
     if ($("#openBatchAddBtn")) {
@@ -303,6 +401,56 @@ function handleMouseUp() {
     document.removeEventListener("mouseup", handleMouseUp);
 }
 
+// 行拖动处理
+function handleFundRowDragStart(e) {
+    draggedFundId = Number(e.target.closest("tr").dataset.fundId);
+    e.dataTransfer.effectAllowed = "move";
+    e.target.closest("tr").style.opacity = "0.5";
+}
+
+function handleFundRowDragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+}
+
+function handleFundRowDrop(e) {
+    e.preventDefault();
+    if (!draggedFundId) return;
+    
+    const targetTr = e.target.closest("tr");
+    if (!targetTr) return;
+    
+    const targetFundId = Number(targetTr.dataset.fundId);
+    if (draggedFundId === targetFundId) return;
+    
+    // 更新顺序
+    const tbody = $("#fundTableBody");
+    const rows = Array.from(tbody.querySelectorAll("tr[data-fund-id]"));
+    
+    const draggedIdx = rows.findIndex(r => Number(r.dataset.fundId) === draggedFundId);
+    const targetIdx = rows.findIndex(r => Number(r.dataset.fundId) === targetFundId);
+    
+    if (draggedIdx !== -1 && targetIdx !== -1) {
+        if (draggedIdx < targetIdx) {
+            // 从上往下拖，插入到目标下方
+            rows[targetIdx].parentNode.insertBefore(rows[draggedIdx], rows[targetIdx].nextSibling);
+        } else {
+            // 从下往上拖，插入到目标上方
+            rows[targetIdx].parentNode.insertBefore(rows[draggedIdx], rows[targetIdx]);
+        }
+        
+        // 保存新的顺序
+        const newOrder = Array.from(tbody.querySelectorAll("tr[data-fund-id]")).map(r => Number(r.dataset.fundId));
+        fundRowOrder = newOrder;
+        localStorage.setItem("fundRowOrder", JSON.stringify(fundRowOrder));
+    }
+}
+
+function handleFundRowDragEnd(e) {
+    e.target.closest("tr").style.opacity = "1";
+    draggedFundId = null;
+}
+
 function applyColumnWidths() {
     const table = $("#sortableTable");
     if (!table) return;
@@ -360,6 +508,19 @@ async function autoFetchAddName() {
 async function autoFetchTradePrice() {
     const code = $("#tradeCode") ? $("#tradeCode").value : "";
     const dateStr = $("#tradeDate") ? $("#tradeDate").value : "";
+    const today = new Date().toISOString().split("T")[0];
+    
+    // 如果是当日交易，使用当前估值
+    if (dateStr === today && $("#tradeForm").fund_id.value) {
+        const fundId = $("#tradeForm").fund_id.value;
+        const fund = allFunds.find(f => f.id == fundId);
+        if (fund && fund.current_price) {
+            $("#tradePrice").value = fund.current_price;
+            return;
+        }
+    }
+    
+    // 否则获取历史价格
     const price = await fetchHistory(code, dateStr);
     if(price) $("#tradePrice").value = price;
 }
@@ -408,19 +569,24 @@ async function loadData(force = false) {
     try {
         let data = await requestJSON(`/api/funds?force=${force ? 1 : 0}`);
 
-        // 异步结算待处理交易（不阻塞UI），如有结算完成则立即刷新一次列表
+        // 仅在 15:00 之后尝试结算已进入待结算窗口的交易，避免每次刷新都逐基金发请求
+        const now = new Date();
+        const settlementCutoff = new Date(now);
+        settlementCutoff.setHours(15, 0, 0, 0);
+
         let settledAny = false;
-        for (const fund of data.funds) {
-            try {
-                const settleResult = await requestJSON(`/api/funds/${fund.id}/settle_pending_trades`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" }
-                });
-                if ((settleResult.settled_count || 0) > 0) {
-                    settledAny = true;
-                }
-            } catch (e) {
-                // 忽略结算失败
+        if (now >= settlementCutoff) {
+            const settlementTargets = data.funds.filter(fund => Number(fund.settlement_review_trade_count || 0) > 0);
+            if (settlementTargets.length > 0) {
+                const settleResults = await Promise.all(
+                    settlementTargets.map(fund =>
+                        requestJSON(`/api/funds/${fund.id}/review_settlement_trades`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" }
+                        }).catch(() => null)
+                    )
+                );
+                settledAny = settleResults.some(result => (result && (result.settled_count || 0) > 0));
             }
         }
 
@@ -433,6 +599,9 @@ async function loadData(force = false) {
         updateSummary(data.summary);
         updateGroupTabs();
         renderTable();
+        
+        // 如果交易对话框打开，更新其中的价格
+        updateTradePriceIfDialogOpen();
     } catch (err) {
         alert(err.message);
     }
@@ -443,6 +612,24 @@ function updateSummary(summary) {
     $("#summaryAlerts").textContent = summary.alerts;
     $("#summaryMarketValue").textContent = formatMoney(summary.total_market_value);
     
+    // 当日盈利
+    const dpnlEl = $("#summaryDailyPnL");
+    if (dpnlEl && summary.total_daily_pnl !== undefined) {
+        const dpnlClass = summary.total_daily_pnl > 0 ? "color-up" : (summary.total_daily_pnl < 0 ? "color-down" : "");
+        dpnlEl.textContent = formatMoney(summary.total_daily_pnl);
+        dpnlEl.className = dpnlClass;
+    }
+    
+    // 当日收益率（当日盈利 / 总市值）
+    const dReturnEl = document.querySelector("#summaryDailyReturn");
+    if (dReturnEl && summary.total_daily_pnl !== undefined && summary.total_market_value > 0) {
+        const dailyReturnRate = (summary.total_daily_pnl / summary.total_market_value) * 100;
+        const drClass = dailyReturnRate > 0 ? "color-up" : (dailyReturnRate < 0 ? "color-down" : "");
+        dReturnEl.textContent = formatPercent(dailyReturnRate);
+        dReturnEl.className = drClass;
+    }
+    
+    // 累计盈亏
     const pnlEl = $("#summaryPnL");
     pnlEl.textContent = formatMoney(summary.total_cumulative_pnl);
     pnlEl.className = summary.total_cumulative_pnl > 0 ? "color-up" : (summary.total_cumulative_pnl < 0 ? "color-down" : "");
@@ -452,20 +639,27 @@ function getGroupSummary(groupName) {
     const list = groupName === "全部" ? allFunds : allFunds.filter(f => splitGroups(f.group_name).includes(groupName));
     let totalMarketValue = 0;
     let totalPnL = 0;
+    let totalDailyPnL = 0;
     let alertCount = 0;
     
     list.forEach(fund => {
         totalMarketValue += fund.market_value || 0;
         totalPnL += fund.cumulative_pnl || 0;
+        totalDailyPnL += fund.daily_pnl || 0;
         if (fund.signal === "buy" || fund.signal === "sell") {
             alertCount += 1;
         }
     });
     
+    // 计算当日收益率 = 当日盈利 / 总市值
+    const daily_return_rate = totalMarketValue > 0 ? (totalDailyPnL / totalMarketValue) * 100 : 0;
+    
     return {
         count: list.length,
         alerts: alertCount,
         total_market_value: totalMarketValue,
+        total_daily_pnl: totalDailyPnL,
+        total_daily_return_rate: daily_return_rate,
         total_pnl: totalPnL
     };
 }
@@ -474,31 +668,52 @@ function renderTable() {
     const tbody = $("#fundTableBody");
     tbody.innerHTML = "";
 
-    const list = allFunds.filter(f => currentGroup === "全部" || splitGroups(f.group_name).includes(currentGroup));
+    let list = allFunds.filter(f => currentGroup === "全部" || splitGroups(f.group_name).includes(currentGroup));
+    
+    // 按照保存的行顺序排序
+    if (fundRowOrder.length > 0) {
+        list.sort((a, b) => {
+            const indexA = fundRowOrder.indexOf(a.id);
+            const indexB = fundRowOrder.indexOf(b.id);
+            const posA = indexA === -1 ? list.length : indexA;
+            const posB = indexB === -1 ? list.length : indexB;
+            return posA - posB;
+        });
+    }
 
     // 在表格前显示分组总览
     const summary = getGroupSummary(currentGroup);
     const groupHeaderEl = $("#groupSummary");
     if (groupHeaderEl) {
+        const dailyPnLClass = summary.total_daily_pnl >= 0 ? 'color-up' : 'color-down';
+        const totalPnLClass = summary.total_pnl >= 0 ? 'color-up' : 'color-down';
         groupHeaderEl.innerHTML = `
-            <div class="group-summary-row">
-                <span>基金数: <strong>${summary.count}</strong></span>
-                <span>预警数: <strong>${summary.alerts}</strong></span>
-                <span>总市值: <strong>${formatMoney(summary.total_market_value)}</strong></span>
-                <span style="${summary.total_pnl >= 0 ? 'color:var(--success,green)' : 'color:var(--danger,red)'};font-weight:bold;margin-left:auto;">总盈亏: ${formatMoney(summary.total_pnl)}</span>
+            <div class="group-summary-row" style="display:flex; align-items:center; gap:2rem; width:100%;">
+                <span>当日盈利: <strong class="${dailyPnLClass}">${formatMoney(summary.total_daily_pnl)}</strong></span>
+                <span>当日收益率: <strong class="${dailyPnLClass}">${formatPercent(summary.total_daily_return_rate)}</strong></span>
+                <span style="margin-left:auto;">总盈亏: <strong class="${totalPnLClass}">${formatMoney(summary.total_pnl)}</strong></span>
             </div>
         `;
     }
 
     if (list.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="13" class="empty">该分组暂无基金。</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="15" class="empty">该分组暂无基金。</td></tr>`;
         return;
     }
 
     list.forEach(fund => {
         const tr = document.createElement("tr");
+        tr.draggable = true;
+        tr.dataset.fundId = fund.id;
+        
         if (fund.signal === "buy") tr.classList.add("signal-buy");
         if (fund.signal === "sell") tr.classList.add("signal-sell");
+        
+        // 添加拖动事件处理
+        tr.addEventListener("dragstart", handleFundRowDragStart);
+        tr.addEventListener("dragover", handleFundRowDragOver);
+        tr.addEventListener("drop", handleFundRowDrop);
+        tr.addEventListener("dragend", handleFundRowDragEnd);
 
         columnOrder.forEach(field => {
             const td = document.createElement("td");
@@ -521,31 +736,11 @@ function getCellHtml(fund, field) {
     switch(field) {
         case "code": return fund.code;
         case "name": {
-            const pendingCount = Number(fund.pending_count || 0);
+            const subtitleTradeCount = Number(fund.subtitle_trade_count || 0);
             let subtitle = "";
             
-            if (pendingCount > 0) {
-                const parts = [];
-                const displayMode = fund.pending_display_mode || "pending";
-
-                if (displayMode === "pending") {
-                    if (fund.pending_buy_shares > 0) {
-                        parts.push(`待买入${formatMoney(fund.pending_buy_amount)}`);
-                    }
-                    if (fund.pending_sell_shares > 0) {
-                        parts.push(`待卖出${formatNumber(fund.pending_sell_shares, 2)}份`);
-                    }
-                } else {
-                    if (fund.pending_buy_shares > 0) {
-                        const settlePrice = fund.pending_price || fund.current_price || 0;
-                        const buyAmount = settlePrice > 0 ? fund.pending_buy_shares * settlePrice : fund.pending_buy_amount;
-                        parts.push(`一笔买入中，合计${formatMoney(buyAmount)}`);
-                    }
-                    if (fund.pending_sell_shares > 0) {
-                        parts.push(`一笔赎回中，合计${formatNumber(fund.pending_sell_shares, 2)}份`);
-                    }
-                }
-
+            if (subtitleTradeCount > 0) {
+                const parts = buildTradeSubtitleParts(fund);
                 subtitle = `<div class="pending-badge">${parts.join(" | ")}</div>`;
             }
             
@@ -571,8 +766,27 @@ function getCellHtml(fund, field) {
         case "daily_change_pct": 
             const dcp = fund.daily_change_pct;
             const dcpText = formatPercent(dcp);
-            const dcpClass = dcp > 0 ? "color-up" : (dcp < 0 ? "color-down" : "");
+            const dcpClass = getColorClass(dcp);
             return `<span class="${dcpClass}">${dcp > 0 ? '+' : ''}${dcpText}</span>`;
+        case "daily_pnl": 
+            const dpnl = fund.daily_pnl !== undefined ? fund.daily_pnl : null;
+            if (dpnl === null || dpnl === undefined) {
+                return `<span class="muted">--</span>`;
+            }
+            if (!fund.market_value || fund.market_value <= 0) {
+                return `<span class="muted">--</span>`;  // 没有持仓时显示 --
+            }
+            const dpnlClass = getColorClass(dpnl);
+            return `<span class="${dpnlClass}">${dpnl > 0 ? '+' : ''}${formatMoney(dpnl)}</span>`;
+        case "yesterday_change_pct": 
+            const ycp = fund.yesterday_change_pct;
+            // 如果值为null或undefined，显示"--"；否则显示实际值（包括0）
+            if (ycp === null || ycp === undefined) {
+                return `<span class="muted">--</span>`;
+            }
+            const ycpText = formatPercent(ycp);
+            const ycpClass = getColorClass(ycp);
+            return `<span class="${ycpClass}">${ycp > 0 ? '+' : ''}${ycpText}</span>`;
         case "buy_line": return formatNumber(fund.buy_line);
         case "sell_line": return formatNumber(fund.sell_line);
         case "signal": 
@@ -580,12 +794,23 @@ function getCellHtml(fund, field) {
             if (fund.signal === "sell") return '<span class="signal-badge sell">准备卖出</span>';
             if (fund.signal === "hold") return '<span class="signal-badge hold">持仓观望</span>';
             return '<span class="signal-badge no-data">无数据</span>';
-        case "holding_shares": return formatNumber(fund.holding_shares, 2);
+        case "holding_shares": return formatNumber(fund.effective_holding_shares ?? fund.holding_shares, 2);
         case "market_value": return formatMoney(fund.market_value);
         case "cumulative_pnl": 
             const pnl = fund.cumulative_pnl;
-            const pnlClass = pnl > 0 ? "color-up" : (pnl < 0 ? "color-down" : "");
-            return `<span class="${pnlClass}">${pnl > 0 ? '+' : ''}${formatMoney(pnl)}</span>`;
+            const costBasis = fund.buy_total || 0;
+            const pnlClass = getColorClass(pnl);
+            
+            let returnRateHtml = "";
+            if (costBasis > 0) {
+                const returnRate = (pnl / costBasis) * 100;
+                returnRateHtml = `<div style="font-size: 0.65em; font-weight: bold; margin-top: 2px; text-align: right;" class="${pnlClass}">${returnRate > 0 ? '+' : ''}${returnRate.toFixed(2)}%</div>`;
+            }
+            
+            return `<div style="text-align: center;">
+                <span class="${pnlClass}">${pnl > 0 ? '+' : ''}${formatMoney(pnl)}</span>
+                ${returnRateHtml}
+            </div>`;
         case "actions": 
             return `
                 <div class="actions">
@@ -722,9 +947,13 @@ function updateBatchPreview() {
         const numValue = parseFloat(value);
         if (isNaN(numValue) || numValue <= 0) continue;
         
-        const status = date === today ? 
-            '<span style="color: var(--warning, #ff9800);">待处理</span>' : 
-            '<span class="color-up">正常</span>';
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayStr = yesterday.toISOString().split("T")[0];
+
+        const status = date >= yesterdayStr ? 
+            '<span style="color: var(--warning, #ff9800);">待结算</span>' : 
+            '<span class="color-up">已结算</span>';
         
         trades.push({
             date: date,
@@ -873,16 +1102,75 @@ async function submitBatchTrades() {
     }
 }
 
-async function deleteFund(fundId, fundName) {
-    if (!confirm(`确定删除基金“${fundName}”吗？此操作会同时删除该基金的所有交易记录。`)) {
+async function deleteFund(fundId, fundName, fundGroupsStr) {
+    const fundGroups = splitGroups(fundGroupsStr);
+    
+    // 场景1: 仅在默认分组中
+    if (fundGroups.length === 1 && fundGroups[0] === "默认分组") {
+        if (!confirm(`确定删除基金"${fundName}"吗？此操作会同时删除该基金的所有交易记录。`)) {
+            return;
+        }
+        try {
+            await requestJSON(`/api/funds/${fundId}`, { method: "DELETE" });
+            loadData(true);
+        } catch (err) {
+            alert(err.message);
+        }
         return;
     }
-    try {
-        await requestJSON(`/api/funds/${fundId}`, { method: "DELETE" });
-        loadData(true);
-    } catch (err) {
-        alert(err.message);
-    }
+    
+    // 场景2: 在一个或多个自定义分组中 - 创建选择对话框
+    const dialog = document.createElement("dialog");
+    
+    let optionsHTML = `<div style="padding:1rem;">该基金在以下分组中：<strong>${fundGroups.join(", ")}</strong><br>请选择操作：</div>`;
+    optionsHTML += `<button type="button" class="btn btn-primary" data-action="delete-all">删除所有分组</button>`;
+    optionsHTML += `<button type="button" class="btn btn-ghost" data-action="delete-group">删除当前分组</button>`;
+    optionsHTML += `<button type="button" class="btn btn-ghost" data-action="cancel">取消</button>`;
+    
+    dialog.innerHTML = optionsHTML;
+    
+    return new Promise((resolve) => {
+        dialog.addEventListener("click", async (e) => {
+            const action = e.target.dataset.action;
+            if (action === "delete-all") {
+                try {
+                    await requestJSON(`/api/funds/${fundId}`, { method: "DELETE" });
+                    loadData(true);
+                    dialog.close();
+                    dialog.remove();
+                    resolve();
+                } catch (err) {
+                    alert(err.message);
+                }
+            } else if (action === "delete-group") {
+                const newGroups = fundGroups.filter(g => g !== currentGroup);
+                const newGroupsStr = joinGroups(newGroups);
+                try {
+                    if (newGroupsStr) {
+                        await requestJSON(`/api/funds/${fundId}`, {
+                            method: "PATCH",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ group_name: newGroupsStr })
+                        });
+                    } else {
+                        await requestJSON(`/api/funds/${fundId}`, { method: "DELETE" });
+                    }
+                    loadData(true);
+                    dialog.close();
+                    dialog.remove();
+                    resolve();
+                } catch (err) {
+                    alert(err.message);
+                }
+            } else {
+                dialog.close();
+                dialog.remove();
+                resolve();
+            }
+        });
+        document.body.appendChild(dialog);
+        dialog.showModal();
+    });
 }
 
 function handleFundTableClick(event) {
@@ -893,7 +1181,12 @@ function handleFundTableClick(event) {
 
     const fundId = Number(nameButton.dataset.fundId);
     const fundName = nameButton.dataset.fundName || "";
-    openNameActionDialog(fundId, fundName);
+    
+    // 从allFunds中获取基金的group_name
+    const fund = allFunds.find(f => f.id === fundId);
+    const fundGroups = fund ? fund.group_name : "默认分组";
+    
+    openNameActionDialog(fundId, fundName, fundGroups);
 }
 
 function initNameActionDialog() {
@@ -914,7 +1207,7 @@ function initNameActionDialog() {
             const action = actionButton.dataset.action;
             if (action === "delete") {
                 closeNameActionDialog();
-                await deleteFund(nameActionState.fundId, nameActionState.fundName);
+                await deleteFund(nameActionState.fundId, nameActionState.fundName, nameActionState.fundGroups);
                 return;
             }
             if (action === "move") {
@@ -944,7 +1237,7 @@ function initNameActionDialog() {
     });
 }
 
-function openNameActionDialog(fundId, fundName) {
+function openNameActionDialog(fundId, fundName, fundGroups) {
     // Lazy initialize if needed
     if (!nameActionDialogEl) {
         initNameActionDialog();
@@ -952,6 +1245,7 @@ function openNameActionDialog(fundId, fundName) {
     
     nameActionState.fundId = fundId;
     nameActionState.fundName = fundName;
+    nameActionState.fundGroups = fundGroups || "默认分组";
     nameActionState.mode = "main";
     renderNameActionDialog();
     if (nameActionDialogEl) {
@@ -1187,8 +1481,41 @@ async function openTradeDialog(fundId, code) {
     const today = new Date().toISOString().split("T")[0];
     $("#tradeDate").value = today;
     
+    // 自动填充当日交易的当前价格
+    if (fund.current_price && fund.current_price > 0) {
+        $("#tradePrice").value = fund.current_price;
+    }
+    
+    // 记录当前对话框的基金ID，用于后续自动更新价格
+    currentTradeDialogFundId = fundId;
+    
     $("#tradeDialog").showModal();
     loadTrades(fundId);
+}
+
+// 如果交易对话框打开，自动更新其中的当前价格
+function updateTradePriceIfDialogOpen() {
+    if (!currentTradeDialogFundId || !$("#tradeDialog").open) {
+        return;
+    }
+    
+    const fund = allFunds.find(f => f.id == currentTradeDialogFundId);
+    if (!fund) return;
+    
+    const today = new Date().toISOString().split("T")[0];
+    const tradeDate = $("#tradeDate").value;
+    
+    // 只在当日交易且用户未手动修改过价格时更新
+    if (tradeDate === today && fund.current_price && fund.current_price > 0) {
+        // 检查价格字段是否为空或者是初始值
+        const currentPrice = $("#tradePrice").value;
+        const previousFund = allFunds.find(f => f.id == currentTradeDialogFundId);
+        
+        // 如果当前价格为空，或者等于之前的价格（说明还是初始值），就更新
+        if (!currentPrice || parseFloat(currentPrice) === 0) {
+            $("#tradePrice").value = fund.current_price;
+        }
+    }
 }
 
 async function loadTrades(fundId) {
@@ -1203,11 +1530,12 @@ async function loadTrades(fundId) {
         
         const today = new Date().toISOString().split("T")[0];
         tbody.innerHTML = res.trades.map((t, idx) => {
-            // 仅当日未结算的交易显示待处理
-            const statusBadge = (t.trade_date === today && !t.is_settled) ? 
-                `<span style="font-size:0.75rem; background:var(--warning, #ff9800); color:white; padding:0.1rem 0.3rem; border-radius:3px;">待处理</span>` : '';
+            // 仅未结算的交易显示待结算
+            const isPending = !t.is_settled;
+            const statusBadge = isPending ? 
+                `<span style="font-size:0.75rem; background:var(--warning, #ff9800); color:white; padding:0.1rem 0.3rem; border-radius:3px;">待结算</span>` : '';
             return `
-            <tr style="${(t.trade_date === today && !t.is_settled) ? 'opacity:0.7;' : ''}" data-field="note" data-trade-id="${t.id}">
+            <tr style="${isPending ? 'opacity:0.7;' : ''}" data-field="note" data-trade-id="${t.id}">
                 <td>${t.trade_date}</td>
                 <td><span class="${t.side === 'buy' ? 'color-down' : 'color-up'}">${t.side === 'buy' ? '买入' : '卖出'}</span></td>
                 <td>${formatNumber(t.shares, 2)}</td>
@@ -1235,43 +1563,14 @@ async function deleteTrade(fundId, tradeId) {
 }
 
 function attachTradeTableResizeHandles() {
-    const table = $("#tradeTableBody");
-    if (!table) return;
-
-    const theadTr = table.parentElement.parentElement.querySelector("thead tr");
-    if (!theadTr) return;
-    
-    const ths = theadTr.querySelectorAll("th");
+    // Apply resize handles using the same mechanism as main table
+    const ths = document.querySelectorAll("#tradeTable thead th");
     ths.forEach((th, idx) => {
-        if (idx < ths.length - 1) {  // 最后一列不添加resize handle
-            const handle = th.querySelector(".resize-handle");
-            if (!handle) {
-                const resizeHandle = document.createElement("div");
-                resizeHandle.className = "resize-handle";
-                resizeHandle.style.cssText = "position:absolute; right:0; top:0; bottom:0; width:6px; cursor:col-resize; user-select:none;";
-                th.style.position = "relative";
-                th.appendChild(resizeHandle);
-                
-                resizeHandle.addEventListener("mousedown", (e) => {
-                    e.preventDefault();
-                    const startX = e.clientX;
-                    const startWidth = th.offsetWidth;
-                    
-                    const handleMouseMove = (e) => {
-                        const diff = e.clientX - startX;
-                        const newWidth = Math.max(40, startWidth + diff);
-                        th.style.width = newWidth + "px";
-                    };
-                    
-                    const handleMouseUp = () => {
-                        document.removeEventListener("mousemove", handleMouseMove);
-                        document.removeEventListener("mouseup", handleMouseUp);
-                    };
-                    
-                    document.addEventListener("mousemove", handleMouseMove);
-                    document.addEventListener("mouseup", handleMouseUp);
-                });
-            }
+        if (idx < ths.length - 1 && !th.querySelector(".resize-handle")) {
+            const resizeHandle = document.createElement("div");
+            resizeHandle.className = "resize-handle";
+            resizeHandle.addEventListener("mousedown", (e) => handleColumnResize(e, th.dataset.field || ""));
+            th.appendChild(resizeHandle);
         }
     });
 }
@@ -1299,3 +1598,5 @@ async function handleTrade(e) {
         alert(err.message);
     }
 }
+
+

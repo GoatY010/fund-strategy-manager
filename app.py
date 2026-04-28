@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -26,19 +27,33 @@ else:
 
 DB_PATH = RUNTIME_DIR / "fund_strategy.db"
 QUOTE_API_TEMPLATE = "https://fundgz.1234567.com.cn/js/{code}.js"
-CACHE_TTL_SECONDS = 45
+CACHE_TTL_SECONDS = 120  # 延长缓存时间到2分钟
 GROUP_SEPARATOR = " | "
+API_TIMEOUT_QUOTE = 1.5  # 缩短行情API超时到1.5秒
+API_TIMEOUT_HISTORY = 1.2  # 缩短历史价格API超时到1.2秒
 
 QUOTE_CACHE: dict[str, dict[str, Any]] = {}
 QUOTE_CACHE_LOCK = threading.Lock()
 HISTORY_PRICE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 HISTORY_PRICE_CACHE_LOCK = threading.Lock()
 
+# 并行请求线程池
+QUOTE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+
 app = Flask(
     __name__,
     template_folder=str(BUNDLE_DIR / "templates"),
     static_folder=str(BUNDLE_DIR / "static"),
 )
+
+
+@app.after_request
+def disable_api_cache(response):
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 def get_db() -> sqlite3.Connection:
@@ -87,8 +102,60 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_trades_fund_id_date
                 ON trades(fund_id, trade_date DESC, id DESC);
+            
+            CREATE TABLE IF NOT EXISTS fund_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund_id INTEGER NOT NULL,
+                quote_date TEXT NOT NULL,
+                current_price REAL,
+                latest_nav REAL,
+                daily_change_pct REAL,
+                quote_time TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(fund_id, quote_date),
+                FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_fund_quotes_date
+                ON fund_quotes(fund_id, quote_date DESC);
+            
+            CREATE TABLE IF NOT EXISTS fund_history_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund_id INTEGER NOT NULL,
+                quote_date TEXT NOT NULL,
+                net_value REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(fund_id, quote_date),
+                FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_fund_history_prices_date
+                ON fund_history_prices(fund_id, quote_date DESC);
             """
         )
+        
+        # 添加fund_quotes表到现有数据库
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS fund_quotes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fund_id INTEGER NOT NULL,
+                    quote_date TEXT NOT NULL,
+                    current_price REAL,
+                    latest_nav REAL,
+                    daily_change_pct REAL,
+                    quote_time TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(fund_id, quote_date),
+                    FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fund_quotes_date
+                    ON fund_quotes(fund_id, quote_date DESC)
+            """)
+        except sqlite3.OperationalError:
+            pass
         
         # 兼容老数据库：尝试添加新列如果尚不存在
         try:
@@ -140,19 +207,33 @@ def parse_quote_jsonp(raw_text: str) -> dict[str, Any] | None:
         return None
 
 
-def fetch_quote(code: str, force_refresh: bool = False) -> dict[str, Any] | None:
-    now = time.time()
+def get_cached_data(cache_dict: dict, cache_lock: threading.Lock, key: Any, force_refresh: bool = False) -> Any | None:
+    """通用缓存获取函数"""
     if not force_refresh:
-        with QUOTE_CACHE_LOCK:
-            cached = QUOTE_CACHE.get(code)
-            if cached and (now - cached["ts"] <= CACHE_TTL_SECONDS):
-                return cached["quote"]
+        with cache_lock:
+            cached = cache_dict.get(key)
+            if cached and (time.time() - cached["ts"] <= CACHE_TTL_SECONDS):
+                return cached["value"]
+    return None
+
+
+def set_cached_data(cache_dict: dict, cache_lock: threading.Lock, key: Any, value: Any) -> None:
+    """通用缓存设置函数"""
+    with cache_lock:
+        cache_dict[key] = {"ts": time.time(), "value": value}
+
+
+def fetch_quote(code: str, force_refresh: bool = False) -> dict[str, Any] | None:
+    # 检查缓存
+    cached_quote = get_cached_data(QUOTE_CACHE, QUOTE_CACHE_LOCK, code, force_refresh)
+    if cached_quote is not None:
+        return cached_quote
 
     quote: dict[str, Any] | None = None
     try:
         response = requests.get(
             QUOTE_API_TEMPLATE.format(code=code),
-            timeout=6,
+            timeout=API_TIMEOUT_QUOTE,
             headers={
                 "User-Agent": "Mozilla/5.0",
                 "Referer": "https://fund.eastmoney.com/",
@@ -163,19 +244,26 @@ def fetch_quote(code: str, force_refresh: bool = False) -> dict[str, Any] | None
         if parsed:
             current_price = to_float(parsed.get("gsz"))
             latest_nav = to_float(parsed.get("dwjz"))
+            daily_change_pct = to_float(parsed.get("gszzl"))
+            
+            # 计算昨日涨跌：根据当日净值和昨日净值计算
+            # 由于API不直接提供，这里使用当日涨幅作为近似或从其他字段推断
+            yesterday_change_pct = None
+            
             quote = {
                 "fund_code": parsed.get("fundcode", code),
                 "name": parsed.get("name") or "",
                 "current_price": current_price if current_price is not None else latest_nav,
                 "latest_nav": latest_nav,
-                "daily_change_pct": to_float(parsed.get("gszzl")),
+                "daily_change_pct": daily_change_pct,
+                "yesterday_change_pct": yesterday_change_pct,  # API不提供，暂设为null
                 "quote_time": parsed.get("gztime") or parsed.get("jzrq"),
             }
     except requests.RequestException:
         quote = None
 
-    with QUOTE_CACHE_LOCK:
-        QUOTE_CACHE[code] = {"ts": now, "quote": quote}
+    # 保存到缓存
+    set_cached_data(QUOTE_CACHE, QUOTE_CACHE_LOCK, code, quote)
     return quote
 
 
@@ -184,13 +272,36 @@ def fetch_history_price(code: str, date_str: str, force_refresh: bool = False) -
         return None
 
     cache_key = (code, date_str)
-    now = time.time()
+    
+    # 1️⃣ 检查内存缓存
+    cached_price = get_cached_data(HISTORY_PRICE_CACHE, HISTORY_PRICE_CACHE_LOCK, cache_key, force_refresh)
+    if cached_price is not None:
+        return cached_price
+    
+    # 2️⃣ 当 force_refresh=False（本地缓存查询）时，优先从本地DB查询
     if not force_refresh:
-        with HISTORY_PRICE_CACHE_LOCK:
-            cached = HISTORY_PRICE_CACHE.get(cache_key)
-            if cached and (now - cached["ts"] <= CACHE_TTL_SECONDS):
-                return cached["price"]
+        try:
+            with get_db() as conn:
+                # 找 fund_id
+                cursor = conn.execute("SELECT id FROM funds WHERE code = ?", (code,))
+                fund_row = cursor.fetchone()
+                if fund_row:
+                    fund_id = fund_row[0]
+                    # 从历史价格表查询
+                    cursor = conn.execute(
+                        "SELECT net_value FROM fund_history_prices WHERE fund_id = ? AND quote_date = ?",
+                        (fund_id, date_str)
+                    )
+                    price_row = cursor.fetchone()
+                    if price_row:
+                        price = price_row[0]
+                        # 保存到缓存
+                        set_cached_data(HISTORY_PRICE_CACHE, HISTORY_PRICE_CACHE_LOCK, cache_key, price)
+                        return price
+        except Exception:
+            pass
 
+    # 3️⃣ 本地查询失败或 force_refresh=True，调用API
     headers = {
         "Referer": f"http://fundf10.eastmoney.com/jjjz_{code}.html",
         "User-Agent": "Mozilla/5.0",
@@ -202,7 +313,7 @@ def fetch_history_price(code: str, date_str: str, force_refresh: bool = False) -
 
     price: float | None = None
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
+        resp = requests.get(url, headers=headers, timeout=API_TIMEOUT_HISTORY)
         data = resp.json()
         items = data.get("Data", {}).get("LSJZList", [])
         if items and len(items) > 0:
@@ -212,9 +323,70 @@ def fetch_history_price(code: str, date_str: str, force_refresh: bool = False) -
     except Exception:
         price = None
 
-    with HISTORY_PRICE_CACHE_LOCK:
-        HISTORY_PRICE_CACHE[cache_key] = {"ts": now, "price": price}
+    # 4️⃣ API调用成功后，自动存储到本地DB
+    if price is not None:
+        try:
+            with get_db() as conn:
+                cursor = conn.execute("SELECT id FROM funds WHERE code = ?", (code,))
+                fund_row = cursor.fetchone()
+                if fund_row:
+                    fund_id = fund_row[0]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO fund_history_prices (fund_id, quote_date, net_value, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (fund_id, date_str, price, now_iso())
+                    )
+        except Exception:
+            pass
+
+    # 保存到缓存
+    set_cached_data(HISTORY_PRICE_CACHE, HISTORY_PRICE_CACHE_LOCK, cache_key, price)
     return price
+
+
+def get_yesterday_change_pct(code: str, today_nav: float | None) -> float | None:
+    """
+    计算昨日涨跌：优先从本地DB查询，避免不必要的API调用
+    """
+    try:
+        with get_db() as conn:
+            cursor = conn.execute("SELECT id FROM funds WHERE code = ?", (code,))
+            fund_row = cursor.fetchone()
+            if not fund_row:
+                return None
+
+            fund_id = fund_row[0]
+            cursor = conn.execute(
+                """
+                SELECT net_value
+                FROM fund_history_prices
+                WHERE fund_id = ?
+                ORDER BY quote_date DESC
+                LIMIT 2
+                """,
+                (fund_id,)
+            )
+            rows = cursor.fetchall()
+
+            if len(rows) >= 2:
+                latest_nav = rows[0][0]
+                previous_nav = rows[1][0]
+                if latest_nav and previous_nav and previous_nav > 0:
+                    # 直接使用历史表最新两条净值计算昨日涨跌
+                    change = ((latest_nav - previous_nav) / previous_nav) * 100
+                    return round(change, 2)
+
+        # 本地历史不足时，回退到当前净值和昨日历史净值
+        if today_nav and today_nav > 0:
+            yesterday = (dt.datetime.now() - dt.timedelta(days=1)).date().isoformat()
+            yesterday_nav = fetch_history_price(code, yesterday, False)
+            if yesterday_nav and yesterday_nav > 0:
+                change = ((today_nav - yesterday_nav) / yesterday_nav) * 100
+                return round(change, 2)
+    except Exception:
+        pass
+    
+    return None
 
 
 def get_payload() -> dict[str, Any]:
@@ -263,6 +435,39 @@ def apply_group_token_change(group_value: str | None, old_name: str | None = Non
     return join_groups(updated)
 
 
+def normalize_amount_and_shares(side: str, amount: float | None, shares: float | None, price: float) -> tuple[float, float]:
+    """
+    标准化金额和份额。根据买卖方向和提供的参数，计算缺失的值。
+    
+    Args:
+        side: "buy" 或 "sell"
+        amount: 金额（可能为None或<=0）
+        shares: 份额（可能为None或<=0）
+        price: 单价
+    
+    Returns:
+        (normalized_amount, normalized_shares)
+    """
+    amount = amount or 0
+    shares = shares or 0
+    
+    # 买入：优先用金额算份额
+    if side == "buy":
+        if amount > 0 and shares <= 0:
+            shares = amount / price if price > 0 else 0
+        elif shares > 0 and amount <= 0:
+            amount = shares * price
+    
+    # 卖出：优先用份额算金额
+    elif side == "sell":
+        if shares > 0 and amount <= 0:
+            amount = shares * price
+        elif amount > 0 and shares <= 0:
+            shares = amount / price if price > 0 else 0
+    
+    return (amount, shares)
+
+
 def compute_signal(current_price: float | None, base_price: float | None, alert_percent: float = 0.05) -> tuple[str, float | None, float | None]:
     if current_price is None or base_price is None or base_price <= 0:
         return "no-data", None, None
@@ -283,6 +488,7 @@ def load_trade_summaries(conn: sqlite3.Connection) -> dict[int, dict[str, float]
             SUM(CASE WHEN side = 'buy' THEN shares * price ELSE 0 END) AS buy_total,
             SUM(CASE WHEN side = 'sell' THEN shares * price ELSE 0 END) AS sell_total
         FROM trades
+        WHERE is_settled = 1
         GROUP BY fund_id
         """
     ).fetchall()
@@ -373,6 +579,12 @@ def delete_group(name: str):
 @app.get("/api/funds")
 def list_funds():
     force_refresh = request.args.get("force") == "1"
+    today = dt.date.today().isoformat()
+    yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    
+    timer_total_start = time.time()
+    timer_db_start = time.time()
+    
     with get_db() as conn:
         funds = conn.execute("SELECT * FROM funds ORDER BY id DESC").fetchall()
         trade_summaries = load_trade_summaries(conn)
@@ -383,46 +595,208 @@ def list_funds():
         for row in trade_rows:
             trade_counts[row["fund_id"]] = int(row["cnt"])
 
-        pending_rows = conn.execute(
+        trade_rows = conn.execute(
             """
             SELECT
                 fund_id,
-                MIN(trade_date) AS earliest_pending_date,
-                SUM(CASE WHEN side = 'buy' THEN COALESCE(shares, 0) ELSE 0 END) AS pending_buy_shares,
-                SUM(CASE WHEN side = 'buy' THEN COALESCE(amount, 0) ELSE 0 END) AS pending_buy_amount,
-                SUM(CASE WHEN side = 'sell' THEN COALESCE(shares, 0) ELSE 0 END) AS pending_sell_shares,
-                SUM(CASE WHEN side = 'sell' THEN COALESCE(amount, 0) ELSE 0 END) AS pending_sell_amount,
-                COUNT(*) AS pending_count
+                MIN(trade_date) AS first_unsettled_trade_date,
+                SUM(CASE WHEN DATE(created_at) = ? THEN 1 ELSE 0 END) AS subtitle_today_trade_count,
+                SUM(CASE WHEN DATE(created_at) = ? THEN 1 ELSE 0 END) AS subtitle_yesterday_trade_count,
+                SUM(CASE WHEN DATE(created_at) < ? THEN 1 ELSE 0 END) AS older_trade_count,
+                SUM(CASE WHEN DATE(created_at) < ? AND trade_date < ? THEN 1 ELSE 0 END) AS settlement_review_trade_count,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'buy' THEN COALESCE(shares, 0) ELSE 0 END) AS subtitle_today_buy_shares,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'buy' THEN COALESCE(amount, 0) ELSE 0 END) AS subtitle_today_buy_amount,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'sell' THEN COALESCE(shares, 0) ELSE 0 END) AS subtitle_today_sell_shares,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'sell' THEN COALESCE(amount, 0) ELSE 0 END) AS subtitle_today_sell_amount,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'buy' THEN COALESCE(shares, 0) ELSE 0 END) AS subtitle_yesterday_buy_shares,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'buy' THEN COALESCE(amount, 0) ELSE 0 END) AS subtitle_yesterday_buy_amount,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'sell' THEN COALESCE(shares, 0) ELSE 0 END) AS subtitle_yesterday_sell_shares,
+                SUM(CASE WHEN DATE(created_at) = ? AND side = 'sell' THEN COALESCE(amount, 0) ELSE 0 END) AS subtitle_yesterday_sell_amount,
+                SUM(CASE WHEN DATE(created_at) < ? AND trade_date < ? AND side = 'buy' THEN COALESCE(shares, 0) ELSE 0 END) AS settlement_review_buy_shares,
+                SUM(CASE WHEN DATE(created_at) < ? AND trade_date < ? AND side = 'buy' THEN COALESCE(amount, 0) ELSE 0 END) AS settlement_review_buy_amount,
+                SUM(CASE WHEN DATE(created_at) < ? AND trade_date < ? AND side = 'sell' THEN COALESCE(shares, 0) ELSE 0 END) AS settlement_review_sell_shares,
+                SUM(CASE WHEN DATE(created_at) < ? AND trade_date < ? AND side = 'sell' THEN COALESCE(amount, 0) ELSE 0 END) AS settlement_review_sell_amount
             FROM trades
             WHERE is_settled = 0
             GROUP BY fund_id
-            """
+            """,
+            (today, yesterday, yesterday, today, today, today, today, today, yesterday, yesterday, yesterday, yesterday, today, today, today, today, today, today, today, today, today),
         ).fetchall()
 
-    pending_summaries: dict[int, dict[str, Any]] = {}
-    for row in pending_rows:
-        earliest_pending_date = str(row["earliest_pending_date"] or "")
-        pending_summaries[int(row["fund_id"])] = {
-            "earliest_pending_date": earliest_pending_date,
-            "pending_buy_shares": float(row["pending_buy_shares"] or 0),
-            "pending_buy_amount": float(row["pending_buy_amount"] or 0),
-            "pending_sell_shares": float(row["pending_sell_shares"] or 0),
-            "pending_sell_amount": float(row["pending_sell_amount"] or 0),
-            "pending_count": int(row["pending_count"] or 0),
+        # 🆕 从本地数据库查询今日行情中的价格信息；今日涨跌不落库，只走内存缓存/实时API
+        local_quotes_rows = conn.execute(
+            """
+            SELECT fund_id, current_price, latest_nav, quote_time, name
+            FROM fund_quotes
+            LEFT JOIN funds ON fund_quotes.fund_id = funds.id
+            WHERE fund_quotes.quote_date = ?
+            """,
+            (today,)
+        ).fetchall()
+        local_quotes = {}
+        for row in local_quotes_rows:
+            local_quotes[row["fund_id"]] = {
+                "current_price": row["current_price"],
+                "latest_nav": row["latest_nav"],
+                "quote_time": row["quote_time"],
+            }
+
+    timer_db = time.time() - timer_db_start
+
+    trade_buckets: dict[int, dict[str, Any]] = {}
+    for row in trade_rows:
+        first_unsettled_trade_date = str(row["first_unsettled_trade_date"] or "")
+        trade_buckets[int(row["fund_id"])] = {
+            "first_unsettled_trade_date": first_unsettled_trade_date,
+            "subtitle_today_trade_count": int(row["subtitle_today_trade_count"] or 0),
+            "subtitle_yesterday_trade_count": int(row["subtitle_yesterday_trade_count"] or 0),
+            "older_trade_count": int(row["older_trade_count"] or 0),
+            "settlement_review_trade_count": int(row["settlement_review_trade_count"] or 0),
+            "subtitle_today_buy_shares": float(row["subtitle_today_buy_shares"] or 0),
+            "subtitle_today_buy_amount": float(row["subtitle_today_buy_amount"] or 0),
+            "subtitle_today_sell_shares": float(row["subtitle_today_sell_shares"] or 0),
+            "subtitle_today_sell_amount": float(row["subtitle_today_sell_amount"] or 0),
+            "subtitle_yesterday_buy_shares": float(row["subtitle_yesterday_buy_shares"] or 0),
+            "subtitle_yesterday_buy_amount": float(row["subtitle_yesterday_buy_amount"] or 0),
+            "subtitle_yesterday_sell_shares": float(row["subtitle_yesterday_sell_shares"] or 0),
+            "subtitle_yesterday_sell_amount": float(row["subtitle_yesterday_sell_amount"] or 0),
+            "settlement_review_buy_shares": float(row["settlement_review_buy_shares"] or 0),
+            "settlement_review_buy_amount": float(row["settlement_review_buy_amount"] or 0),
+            "settlement_review_sell_shares": float(row["settlement_review_sell_shares"] or 0),
+            "settlement_review_sell_amount": float(row["settlement_review_sell_amount"] or 0),
         }
 
     data: list[dict[str, Any]] = []
     summary_market_value = 0.0
     summary_pnl = 0.0
+    summary_daily_pnl = 0.0
     alert_count = 0
 
+    # 🆕 今日涨跌只从内存缓存/实时API获取，不从数据库读取
+    timer_api_start = time.time()
+    quotes_dict = {}
+    api_call_count = 0
+
+    # 1️⃣  非手动刷新优先使用内存缓存；手动刷新才全量重拉实时行情
+    missing_codes: list[str] = []
+    for fund in funds:
+        code = fund["code"]
+        if not force_refresh:
+            cached_quote = get_cached_data(QUOTE_CACHE, QUOTE_CACHE_LOCK, code, False)
+            if cached_quote is not None:
+                quotes_dict[code] = cached_quote
+                continue
+
+        missing_codes.append(code)
+
+    
+    if missing_codes:
+        api_call_count = len(missing_codes)
+        try:
+            # 并行获取缺失的基金行情
+            futures = {QUOTE_EXECUTOR.submit(fetch_quote, code, True): code for code in missing_codes}
+            for future in concurrent.futures.as_completed(futures, timeout=30):
+                code = futures[future]
+                try:
+                    quote = future.result(timeout=5)
+                    if quote:
+                        quotes_dict[code] = quote
+                except Exception:
+                    quotes_dict[code] = None
+        except concurrent.futures.TimeoutError:
+            pass
+        
+        # 💾 将获取到的API数据存储到本地数据库，同时异步获取昨日净值
+        # 1️⃣ 先并行获取所有缺失基金的昨日净值
+        yesterday_prices_dict: dict[str, float | None] = {}
+        yesterday_str = (dt.datetime.now() - dt.timedelta(days=1)).date().isoformat()
+        
+        if missing_codes:
+            try:
+                yesterday_futures = {
+                    QUOTE_EXECUTOR.submit(fetch_history_price, code, yesterday_str, True): code 
+                    for code in missing_codes
+                }
+                for future in concurrent.futures.as_completed(yesterday_futures, timeout=30):
+                    code = yesterday_futures[future]
+                    try:
+                        price = future.result(timeout=5)
+                        yesterday_prices_dict[code] = price
+                    except Exception:
+                        yesterday_prices_dict[code] = None
+            except concurrent.futures.TimeoutError:
+                pass
+        
+        # 2️⃣ 存储行情数据和历史价格
+        with get_db() as conn:
+            for code, quote in quotes_dict.items():
+                if quote and code in missing_codes:  # 只存储本次API调用的结果
+                    # 找出对应的fund_id
+                    fund_row = next((f for f in funds if f["code"] == code), None)
+                    if fund_row:
+                        fund_id = int(fund_row["id"])
+                        
+                        try:
+                            # 存储今日价格信息，但不落库今日涨跌
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO fund_quotes
+                                (fund_id, quote_date, current_price, latest_nav, quote_time, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    fund_id,
+                                    today,
+                                    quote.get("current_price"),
+                                    quote.get("latest_nav"),
+                                    quote.get("quote_time"),
+                                    now_iso(),
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        
+                        # 3️⃣ 存储昨日历史价格（如果获取成功）
+                        yesterday_price = yesterday_prices_dict.get(code)
+                        if yesterday_price is not None:
+                            try:
+                                conn.execute(
+                                    """
+                                    INSERT OR REPLACE INTO fund_history_prices
+                                    (fund_id, quote_date, net_value, created_at)
+                                    VALUES (?, ?, ?, ?)
+                                    """,
+                                    (fund_id, yesterday_str, yesterday_price, now_iso()),
+                                )
+                                
+                                # 计算昨日涨跌并更新quote对象
+                                today_nav = quote.get("latest_nav")
+                                if today_nav and today_nav > 0 and yesterday_price > 0:
+                                    yesterday_change = round(((today_nav - yesterday_price) / yesterday_price) * 100, 2)
+                                    quote["yesterday_change_pct"] = yesterday_change
+                            except Exception:
+                                pass
+    
+    timer_api = time.time() - timer_api_start
+    
     for fund in funds:
         fund_id = int(fund["id"])
         code = fund["code"]
         group_name = join_groups(split_groups(fund["group_name"]))
         alert_percent = float(fund["alert_percent"])
         
-        quote = fetch_quote(code, force_refresh=force_refresh)
+        quote = quotes_dict.get(code)
+        if quote is None:
+            local_quote = local_quotes.get(fund_id)
+            if local_quote is not None:
+                quote = {
+                    "current_price": local_quote["current_price"],
+                    "latest_nav": local_quote["latest_nav"],
+                    "daily_change_pct": None,
+                    "yesterday_change_pct": None,
+                    "quote_time": local_quote["quote_time"],
+                    "name": fund["name"],
+                }
 
         current_price = quote["current_price"] if quote else None
         latest_nav = quote["latest_nav"] if quote else None
@@ -434,10 +808,34 @@ def list_funds():
         shares = float(fund["holding_shares"] or 0)
         signal, buy_line, sell_line = compute_signal(current_price, base_price, alert_percent)
 
+        trade_bucket = trade_buckets.get(fund_id, {
+            "first_unsettled_trade_date": "",
+            "subtitle_today_trade_count": 0,
+            "subtitle_yesterday_trade_count": 0,
+            "older_trade_count": 0,
+            "settlement_review_trade_count": 0,
+            "subtitle_today_buy_shares": 0.0,
+            "subtitle_today_buy_amount": 0.0,
+            "subtitle_today_sell_shares": 0.0,
+            "subtitle_today_sell_amount": 0.0,
+            "subtitle_yesterday_buy_shares": 0.0,
+            "subtitle_yesterday_buy_amount": 0.0,
+            "subtitle_yesterday_sell_shares": 0.0,
+            "subtitle_yesterday_sell_amount": 0.0,
+            "settlement_review_buy_shares": 0.0,
+            "settlement_review_buy_amount": 0.0,
+            "settlement_review_sell_shares": 0.0,
+            "settlement_review_sell_amount": 0.0,
+        })
+        subtitle_trade_count = trade_bucket["subtitle_yesterday_trade_count"] + trade_bucket["subtitle_today_trade_count"]
+
         trade_info = trade_summaries.get(fund_id, {"buy_total": 0.0, "sell_total": 0.0})
-        valuation_price = current_price if current_price is not None else base_price
-        market_value = shares * valuation_price if valuation_price else 0.0
-        cumulative_pnl = market_value + trade_info["sell_total"] - trade_info["buy_total"]
+        # 市值按当前估值计算，优先使用实时估值，其次回退到最新净值或成交价
+        valuation_price = current_price if current_price is not None else (latest_nav if latest_nav is not None else base_price)
+        effective_shares = shares + trade_bucket["settlement_review_buy_shares"]
+        effective_buy_total = trade_info["buy_total"] + trade_bucket["settlement_review_buy_amount"]
+        market_value = effective_shares * valuation_price if valuation_price else 0.0
+        cumulative_pnl = market_value + trade_info["sell_total"] - effective_buy_total
 
         if signal in {"buy", "sell"}:
             alert_count += 1
@@ -453,25 +851,19 @@ def list_funds():
         elif not has_trades or abs(market_value) < 1e-9:
             auto_mode = "watch"
 
-        pending_summary = pending_summaries.get(fund_id, {
-            "earliest_pending_date": "",
-            "pending_buy_shares": 0.0,
-            "pending_buy_amount": 0.0,
-            "pending_sell_shares": 0.0,
-            "pending_sell_amount": 0.0,
-            "pending_count": 0,
-        })
-
-        # 文案切换逻辑：当交易日净值已可获取时，显示“买入中/赎回中”；否则显示“待买入/待卖出”。
-        pending_display_mode = "pending"
-        pending_price = None
-        if pending_summary["pending_count"] > 0 and pending_summary["earliest_pending_date"]:
-            pending_price = fetch_history_price(code, pending_summary["earliest_pending_date"], force_refresh=force_refresh)
-            if pending_price is not None:
-                pending_display_mode = "settling"
-        
-        # 持仓份额四舍五入保留两位
+        # 持仓份额四舍五入保留两位，仅用于展示
         rounded_shares = round(shares, 2)
+
+        # 计算当日盈利 = 持仓市值 × (当日涨跌% / 100)
+        daily_pnl = 0.0
+        if market_value and daily_change_pct is not None:
+            daily_pnl = float(market_value * (daily_change_pct / 100))
+        summary_daily_pnl += daily_pnl
+        
+        # 获取昨日涨跌百分比（如果无数据则为0）
+        yesterday_change_pct = get_yesterday_change_pct(code, latest_nav)
+        if yesterday_change_pct is None:
+            yesterday_change_pct = 0.0
 
         data.append(
             {
@@ -486,25 +878,51 @@ def list_funds():
                 "current_price": current_price,
                 "latest_nav": latest_nav,
                 "daily_change_pct": daily_change_pct,
+                "yesterday_change_pct": yesterday_change_pct,
                 "quote_time": quote_time,
                 "buy_line": buy_line,
                 "sell_line": sell_line,
                 "signal": signal,
                 "market_value": market_value,
-                "buy_total": trade_info["buy_total"],
+                "buy_total": effective_buy_total,
                 "sell_total": trade_info["sell_total"],
-                "pending_buy_shares": pending_summary["pending_buy_shares"],
-                "pending_buy_amount": pending_summary["pending_buy_amount"],
-                "pending_sell_shares": pending_summary["pending_sell_shares"],
-                "pending_sell_amount": pending_summary["pending_sell_amount"],
-                "pending_count": pending_summary["pending_count"],
-                "pending_display_mode": pending_display_mode,
-                "pending_price": pending_price,
+                "effective_holding_shares": round(effective_shares, 2),
+                # subtitle_* 只给名称下方小字展示，不参与结算触发。
+                "subtitle_trade_count": subtitle_trade_count,
+                "subtitle_yesterday_trade_count": trade_bucket["subtitle_yesterday_trade_count"],
+                "subtitle_today_trade_count": trade_bucket["subtitle_today_trade_count"],
+                "subtitle_yesterday_buy_shares": trade_bucket["subtitle_yesterday_buy_shares"],
+                "subtitle_yesterday_buy_amount": trade_bucket["subtitle_yesterday_buy_amount"],
+                "subtitle_yesterday_sell_shares": trade_bucket["subtitle_yesterday_sell_shares"],
+                "subtitle_yesterday_sell_amount": trade_bucket["subtitle_yesterday_sell_amount"],
+                "subtitle_today_buy_shares": trade_bucket["subtitle_today_buy_shares"],
+                "subtitle_today_buy_amount": trade_bucket["subtitle_today_buy_amount"],
+                "subtitle_today_sell_shares": trade_bucket["subtitle_today_sell_shares"],
+                "subtitle_today_sell_amount": trade_bucket["subtitle_today_sell_amount"],
+                # settlement_review_* 只给第二日的二次检查和历史净值回写使用。
+                "settlement_review_trade_count": trade_bucket["settlement_review_trade_count"],
+                "settlement_review_buy_shares": trade_bucket["settlement_review_buy_shares"],
+                "settlement_review_buy_amount": trade_bucket["settlement_review_buy_amount"],
+                "settlement_review_sell_shares": trade_bucket["settlement_review_sell_shares"],
+                "settlement_review_sell_amount": trade_bucket["settlement_review_sell_amount"],
                 "cumulative_pnl": cumulative_pnl,
+                "daily_pnl": daily_pnl,
                 "updated_at": fund["updated_at"],
                 "quote_available": quote is not None,
             }
         )
+
+    timer_total = time.time() - timer_total_start
+    
+    # 🔍 性能日志输出
+    print(f"\n📊 刷新性能统计:")
+    print(f"   数据库查询: {timer_db*1000:.1f}ms (基金数: {len(funds)})")
+    if api_call_count > 0:
+        print(f"   API行情请求: {timer_api*1000:.1f}ms ({api_call_count}/{len(funds)} 个基金)")
+    else:
+        print(f"   API行情请求: 0ms (全部来自本地数据库 ✨)")
+    print(f"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"   总耗时: {timer_total*1000:.1f}ms")
 
     return jsonify(
         {
@@ -514,8 +932,15 @@ def list_funds():
                 "alerts": alert_count,
                 "total_market_value": summary_market_value,
                 "total_cumulative_pnl": summary_pnl,
+                "total_daily_pnl": summary_daily_pnl,
             },
             "generated_at": now_iso(),
+            "_perf": {
+                "db_ms": int(timer_db * 1000),
+                "api_ms": int(timer_api * 1000),
+                "api_calls": api_call_count,
+                "total_ms": int(timer_total * 1000),
+            }
         }
     )
 
@@ -753,28 +1178,18 @@ def create_trade(fund_id: int):
     shares = to_float(payload.get("shares"))
     amount = to_float(payload.get("amount"))
 
-    # 按金额买入时自动计算份额
-    if side == "buy":
-        if amount is not None and amount > 0 and (shares is None or shares <= 0):
-            shares = amount / price
-        elif shares is not None and shares > 0 and (amount is None or amount <= 0):
-            amount = shares * price
-            
-    # 按份额卖出时计算金额
-    if side == "sell":
-        if shares is not None and shares > 0 and (amount is None or amount <= 0):
-            amount = shares * price
-        elif amount is not None and amount > 0 and (shares is None or shares <= 0):
-            shares = amount / price
-
+    # 标准化金额和份额
+    amount, shares = normalize_amount_and_shares(side, amount, shares, price)
+    
     if shares is None or shares <= 0:
         return jsonify({"error": "份额或金额必须大于 0。"}), 400
 
     note = str(payload.get("note", "")).strip()
     created_at = now_iso()
     
-    # 判断是否为当日交易（未结算）
-    is_settled = 1 if trade_date != dt.date.today().isoformat() else 0
+    # 交易日为今天或昨天时，先按待结算处理；更早的历史回填直接按已结算处理。
+    yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    is_settled = 1 if trade_date < yesterday else 0
 
     with get_db() as conn:
         fund = conn.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()
@@ -815,7 +1230,7 @@ def create_trade(fund_id: int):
                 (new_shares, update_price, created_at, fund_id),
             )
 
-    msg = "交易已录入并更新基准价。" if is_settled else "交易已提交为待处理状态，将在第二天或晚间价格更新后自动结算。"
+    msg = "交易已录入并更新基准价。" if is_settled else "交易已提交为待结算状态，将在第二天或晚间价格更新后自动结算。"
     return jsonify({"ok": True, "message": msg})
 
 
@@ -836,7 +1251,7 @@ def batch_create_trades(fund_id: int):
         return jsonify({"error": "数据为空"}), 400
     
     success_count = 0
-    pending_count = 0
+    today_trade_count = 0
     created_at = now_iso()
     today = dt.date.today().isoformat()
     
@@ -905,8 +1320,8 @@ def batch_create_trades(fund_id: int):
                 except (ValueError, TypeError):
                     continue
             
-            # 判断是否为当日交易
-            is_settled = 1 if trade_date != today else 0
+            # 交易日为今天或昨天时，先按待结算处理；更早的历史回填直接按已结算处理。
+            is_settled = 1 if trade_date < (dt.date.today() - dt.timedelta(days=1)).isoformat() else 0
             
             # 仅当is_settled=1时才更新current_shares
             if is_settled:
@@ -924,7 +1339,7 @@ def batch_create_trades(fund_id: int):
             )
             success_count += 1
             if is_settled == 0:
-                pending_count += 1
+                today_trade_count += 1
             
         if success_count > 0:
             conn.execute(
@@ -937,8 +1352,8 @@ def batch_create_trades(fund_id: int):
             )
             
     msg = f"成功导入 {success_count} 笔交易记录"
-    if pending_count > 0:
-        msg += f" ({pending_count} 笔待处理)"
+    if today_trade_count > 0:
+        msg += f" ({today_trade_count} 笔当日交易)"
     return jsonify({"ok": True, "message": msg})
 
 @app.delete("/api/funds/<int:fund_id>/trades/<int:trade_id>")
@@ -990,8 +1405,9 @@ def delete_trade(fund_id: int, trade_id: int):
 
 
 @app.post("/api/funds/<int:fund_id>/settle_pending_trades")
-def settle_pending_trades(fund_id: int):
-    """处理待处理的T+0交易，在T+1时将其标记为已结算"""
+@app.post("/api/funds/<int:fund_id>/review_settlement_trades")
+def review_settlement_trades(fund_id: int):
+    """第二日二次检查未结算交易，按历史净值回写后标记为已结算。"""
     now = dt.datetime.now()
     today = now.date().isoformat()
 
@@ -1003,8 +1419,8 @@ def settle_pending_trades(fund_id: int):
         if not fund:
             return jsonify({"error": "基金不存在。"}), 404
         
-        # 查询昨日未结算的交易
-        pending_trades = conn.execute(
+        # 查询需要进入结算流程的未结算交易（今天以前）
+        settlement_trades = conn.execute(
             """
             SELECT id, trade_date, side, amount, shares, price
             FROM trades
@@ -1014,14 +1430,14 @@ def settle_pending_trades(fund_id: int):
             (fund_id, today)
         ).fetchall()
         
-        if not pending_trades:
+        if not settlement_trades:
             return jsonify({"ok": True, "settled_count": 0, "message": "没有待结算的交易。"})
         
         settled_count = 0
         current_shares = float(fund["holding_shares"] or 0)
         last_price = float(fund["last_trade_price"] or 1.0)
         
-        for trade in pending_trades:
+        for trade in settlement_trades:
             trade_date = trade["trade_date"]
             side = trade["side"]
             raw_amount = float(trade["amount"] or 0)
@@ -1078,7 +1494,7 @@ def settle_pending_trades(fund_id: int):
                 (current_shares, last_price, now_iso(), fund_id),
             )
         
-        return jsonify({"ok": True, "settled_count": settled_count, "message": f"成功结算 {settled_count} 笔待处理交易。"})
+        return jsonify({"ok": True, "settled_count": settled_count, "message": f"成功结算 {settled_count} 笔待结算交易。"})
 
 
 @app.get("/api/get_history_price")

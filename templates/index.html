@@ -82,6 +82,8 @@
                             <th draggable="true" data-field="last_trade_price">上次成交</th>
                             <th draggable="true" data-field="current_price">当前估值</th>
                             <th draggable="true" data-field="daily_change_pct">今日涨跌</th>
+                            <th draggable="true" data-field="daily_pnl">当日盈利</th>
+                            <th draggable="true" data-field="yesterday_change_pct">昨日涨跌</th>
                             <th draggable="true" data-field="buy_line">买入线</th>
                             <th draggable="true" data-field="sell_line">卖出线</th>
                             <th draggable="true" data-field="signal">信号</th>
@@ -93,7 +95,7 @@
                     </thead>
                     <tbody id="fundTableBody">
                         <tr>
-                            <td colspan="13" class="empty">加载中...</td>
+                            <td colspan="15" class="empty">加载中...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -298,6 +300,6 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v={{ range(0, 999999) | random }}"></script>
 </body>
 </html>
